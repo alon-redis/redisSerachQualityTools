@@ -18,13 +18,14 @@ This application is a comprehensive Redis performance testing utility designed t
 - Required Python packages:
   - `redis`
   - `faker`
+  - `typing_extensions`
 
 ## Installation
 ```bash
 apt-get update
 apt-get upgrade -Vy
 apt install -y python3-pip
-pip3 install redis faker
+pip3 install redis faker typing_extensions
 ```
 
 ## Usage
