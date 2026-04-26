@@ -1,0 +1,140 @@
+Part 1 — Pain Points (code + redis.io evidence)
+Query-language dialect traps
+Four dialect versions (MAX_DIALECT_VERSION = 4 — src/spec.h:127-128); the same string means different things across them. Examples (from redis.io / query_syntax):
+hello world | "goodbye" moon → (hello world | "goodbye") moon in dialect 1, top-level OR in dialect 2+.
+-hello world → "neither hello nor world" in dialect 1, "-hello AND world" in dialect 2+.
+@name:James Brown binds @name to both words in dialect 1, only to James in dialect 2+.
+GEOSHAPE and JSON multi-value require DIALECT 3.
+FT.HYBRID rejects DIALECT entirely — only search-default-dialect applies (src/hybrid/parse/hybrid_optional_args.h:22-23, src/hybrid/parse/hybrid_callbacks.c:227-232).
+Hard limits and caps
+MAXDOCTABLESIZE is capped at 100M docs (src/config.h:334).
+MAXSEARCHRESULTS / MAXAGGREGATERESULTS default to 1<<31 and max KNN k is 1<<58 — pathological work slips through (src/config.h:317-324).
+Prefix expansion capped at 200 terms (MAXPREFIXEXPANSIONS — src/config.h:321); silently truncates.
+MINPREFIX is 2, MINSTEMLEN is 4 — short prefixes are rejected.
+INDEX_CURSOR_LIMIT is 128 per index (src/config.h:317, src/cursor.c:242-246).
+Deep paging breaks the optimiser with OFFSET/LIMIT too large for optimizer allocation (src/query_optimizer.c:316-328).
+Geo WKT string ≤ 128 bytes (src/rs_geo.c:113-115); tag value ≤ 4 KiB (src/tag_index.c:29-30).
+SPEC_MAX_FIELDS = 1024 but text-field mask is 128 bits on 64-bit ABIs and 64 bits elsewhere (src/redisearch.h:42-50, src/spec.h:118-119).
+Fuzzy Levenshtein distance capped at 3.
+Flex / Search-on-Disk is very restrictive
+10 indexes per shard (FLEX_MAX_INDEX_COUNT — src/search_disk_utils.h:18).
+No FT.AGGREGATE, FT.HYBRID, FT.CURSOR, FT.ALTER, dictionaries, synonyms, suggestions, spell-check, NUMERIC/GEO/GEOSHAPE, JSON, FLAT/SVS; FT.SEARCH must use NOCONTENT or RETURN 0, no SORTBY/LOAD/SLOP/INORDER/HIGHLIGHT/SUMMARIZE; SLOP scorers (TFIDF, BM25) blocked (docs/design/search_on_disk_mvp_feature_blocking.md).
+FT.HYBRID rough edges
+Parser accepts EXPLAINSCORE then rejects it: "EXPLAINSCORE is not yet supported by FT.HYBRID" (src/hybrid/parse/hybrid_optional_args.c:152-156, 221-223).
+LIMIT clamped: "LIMIT exceeds maximum of %llu" (src/hybrid/parse/hybrid_callbacks.c:77-79).
+YIELD_SCORE_AS is a TODO (src/hybrid/parse/hybrid_optional_args.c:203-204).
+Only two subqueries supported today (src/hybrid/parse_hybrid.c:719).
+Query vectors are VecSim_Normalized inside the hybrid reader — raw dot-product intuition breaks (src/iterators/hybrid_reader.c:285-287).
+Vector / SVS limits
+LVQ / SVS-VAMANA is Intel-only and requires BUILD_INTEL_SVS_OPT (src/vector_index.c:27-45).
+BLOCK_SIZE is deprecated on FLAT/HNSW (src/spec.c:702-707, 722-727); per-element vector size bounded (src/spec.c:708-710, 728-730).
+JSON vector mismatches produce Invalid vector length. Expected %lu, got %lu (src/json.c:299-301).
+KNN appears at most once per query (dialect 2+); VECTOR_RANGE can repeat.
+Coordinator / cluster quirks
+Topology refresh is 1 Hz (src/coord/rmr/redis_cluster.c:243-248).
+TOPOLOGY_VALIDATION_TIMEOUT = 0 means "wait forever"; non-zero still lets pending requests through on incomplete topology (src/coord/config.c:265-268).
+CONN_PER_SHARD = 0 resolves to WORKERS + 1 — tuning one silently changes the other (src/coord/config.c:246-248).
+On the coordinator spec is NULL, so INDEX_CURSOR_LIMIT behaves differently (src/cursor.c:241-242).
+RESP2 + TIMEOUT_AFTER_N=0 needs a coordinator timeout workaround for MOD-12640 (src/aggregate/aggregate_debug.c:142-151).
+FT.SUG* is key-based — hostile to OSS cluster routing.
+Noisy configuration surface
+Every key has both a legacy FT.CONFIG name and a canonical search-* name and must be kept in sync (src/config.c:42-70).
+MT_MODE / WORKER_THREADS are deprecated; max workers 16 (src/config.c:660-667, src/config.h:304-305).
+FT.CONFIG and module load-line args themselves marked deprecated (src/config.c:1313-1333).
+ON_TIMEOUT TODO: timeout not checked before starting worker threads (src/result_processor.c:1960-1962).
+ON_TIMEOUT = RETURN_STRICT + TIMEOUT_AFTER_N is explicitly rejected (src/aggregate/aggregate_debug.c:131-137).
+A/A and persistence caveats
+FT.SUG* disabled on CRDT (src/suggest.c:19-26).
+CRDT empty-key semantics leak via DocumentType_Unsupported with TODO:FIX (src/notifications.c:199-205, src/spec.c:4009-4011).
+Index type registers both aux_save and aux_save2 (src/spec.c:3793-3800, src/dictionary.c:256-261).
+Version / platform
+Requires Redis ≥ 8.4.0 (src/module.c:1238-1242, 1316-1318).
+32-bit not supported; ASAN Linux-only; macOS needs Homebrew llvm@21 (developer.md:205-211, 333-335).
+Operational costs users don't expect
+Pure negative queries (e.g. -foo) scan the whole index (redis.io / query_syntax § Pure negative queries).
+Prefix / infix / suffix without WITHSUFFIXTRIE iterates the entire term dictionary.
+FT.AGGREGATE without WITHCURSOR materialises the whole pipeline.
+Fork-GC needs memory headroom; tight-memory hosts see latency spikes.
+FT.HYBRID with RRF and large WINDOW pulls WINDOW * k candidates per shard.
+Part 2 — How to Build Complex Queries
+Mental model. A query is (a) a filter query built from @field:... predicates combined with booleans, plus (b) execution options (RETURN, SORTBY, LIMIT, TIMEOUT, PARAMS, DIALECT, and for FT.AGGREGATE the pipeline).
+
+Building blocks (cheat sheet).
+
+
+foo bar                implicit AND
+"hello world"          exact phrase
+alpha|beta             OR
+-foo                   NOT (use sparingly)
+~foo                   optional, rank boost
+@title:foo             field qualifier
+@title|body:(a b)      multi-field qualifier
+(a|b) (c|d)            grouping
+@price:[100 200]       numeric range; ( for exclusive; -inf/+inf
+@city:{NY|LA}          tag (union); repeat clause for intersection
+@loc:[-122 37.77 5 km] geo radius
+@geom:[WITHIN $p]      geoshape (DIALECT 3 + PARAMS)
+hel*  *ing  *sun*      prefix / suffix / infix
+"w'foo*bar?'"          wildcard (DIALECT 2+)
+%hello%                fuzzy LD1; %%...%% LD2; %%%...%%% LD3
+(a b) => { $weight: 2; $slop: 1; $inorder: true }
+*=>[KNN 10 @vec $qv AS score]
+filter=>[KNN 10 @vec $qv]
+@vec:[VECTOR_RANGE 0.5 $qv]
+Step-by-step pattern.
+
+Pin a dialect (DIALECT 2 almost always; 3 for JSON multi-value / GEOSHAPE).
+Parameterise with PARAMS — every literal you don't want inlined.
+Compose per field, parenthesising aggressively.
+Combine with explicit booleans: default AND, | inside groups, - sparingly, ~ only for boosters.
+Project and rank: RETURN, SORTBY (needs SORTABLE), pick a scorer (default BM25STD).
+Bound cost: LIMIT, TIMEOUT, INKEYS, INFIELDS.
+Inspect with FT.EXPLAIN / FT.PROFILE SEARCH.
+Worked examples (all in the file; here are the highlights):
+
+Filtered vector "pre-filter KNN":
+
+
+FT.SEARCH products
+  '(@in_stock:{true} @price:[(0 500] @category:{phones|tablets})
+     =>[KNN 50 @embedding $qv AS score]'
+  PARAMS 2 qv <bytes>
+  SORTBY score
+  DIALECT 2
+Hybrid lexical + vector:
+
+
+FT.HYBRID products 2
+  SEARCH '@in_stock:{true} @category:{phones|tablets}'
+  VSIM   '@embedding $qv'
+  COMBINE RRF 2 WINDOW 50
+  PARAMS 2 qv <bytes>
+  SORTBY 2 @__score DESC
+  LIMIT 0 20
+(Do not add DIALECT or EXPLAINSCORE — both are rejected.)
+
+Tag intersection (union is @f:{a|b|c}, intersection requires repeating the clause):
+
+
+@tags:{ai} @tags:{vector} @tags:{rag}
+Polygon search (needs DIALECT 3):
+
+
+FT.SEARCH shapes
+  '@g:[WITHIN $poly]'
+  PARAMS 2 poly 'POLYGON((0 0, 0 100, 100 100, 100 0, 0 0))'
+  DIALECT 3
+Aggregation with grouping and cursor pagination:
+
+
+FT.AGGREGATE products
+  '@in_stock:{true} @price:[0 200]'
+  GROUPBY 1 @category
+    REDUCE COUNT 0 AS n
+    REDUCE AVG 1 @price AS avg_price
+  APPLY 'format("%s: %d", @category, @n)' AS label
+  SORTBY 2 @n DESC
+  LIMIT 0 10
+  WITHCURSOR COUNT 1000 MAXIDLE 60000
+  DIALECT 2
+Anti-patterns. Starting with -; 1-letter prefixes; LD > 3 fuzzy; @field:a b c (only a is qualified under dialect 2+); @city:Tel Aviv on a tag field; uncapped KNN k; inlining vectors into the query string; using TFIDF / BM25 on Flex; assuming raw dot-product in FT.HYBRID.
