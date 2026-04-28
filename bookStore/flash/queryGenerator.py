@@ -39,6 +39,12 @@ IS_AVAILABLE_VALUES = ["true", "false"]
 VERIFICATION_AUTHOR_TOKEN = "Shmuely"
 VERIFICATION_TITLE_TOKEN = "QA"
 
+# Populator-side key shape (must stay in sync with bookHashPopulatorOnDisk.py).
+# REDIS_KEY_BASE = "alon:shmuely:redis:data:store:application"
+# make_key(book_id) -> f"{REDIS_KEY_BASE}:{book_id}"
+POPULATOR_KEY_PREFIX = "alon:shmuely:redis:data:store:application:"
+VERIFICATION_KEY = POPULATOR_KEY_PREFIX + "0"
+
 
 # ---------------------------------------------------------------------------
 # Counters
@@ -48,6 +54,15 @@ COUNTERS = {
     "queries_errors": 0,
     "queries_zero_results": 0,
     "docs_returned": 0,
+    # DEL workload counters. del_attempts == sum of all the other del_* below
+    # by construction, so the breakdown is exhaustive.
+    "del_attempts": 0,
+    "del_actually_deleted": 0,
+    "del_missed": 0,
+    "del_skipped_verification": 0,
+    "del_skipped_other_prefix": 0,
+    "del_empty_keyspace": 0,
+    "del_errors": 0,
 }
 COUNTERS_LOCK = threading.Lock()
 
@@ -488,6 +503,89 @@ def run_worker(connection_pool, build_query_fn, pipeline_depth, limit, stop_even
             )
 
 
+# ---------------------------------------------------------------------------
+# Background DEL workload (RANDOMKEY + DEL)
+# ---------------------------------------------------------------------------
+# Runs in its own thread on a *dedicated* connection pool so it never competes
+# with FT.SEARCH workers for connections or pool slots. Two pacing modes:
+#   - "rate"  : sleep-to-rate, target N deletes/second (--del-rate)
+#   - "burst" : every S seconds, fire N deletes back-to-back (--del-burst,
+#               --del-burst-interval)
+# Hard safety:
+#   - VERIFICATION_KEY (book_id 0) is never deleted.
+#   - When --del-only-prefix is set (default), keys not under POPULATOR_KEY_PREFIX
+#     are skipped (RANDOMKEY scans the *entire* keyspace).
+
+def _attempt_del_once(r, only_prefix):
+    """One RANDOMKEY[+DEL] iteration. Updates counters; never raises."""
+    increment_counter("del_attempts")
+    try:
+        key = r.randomkey()
+    except (
+        redis.exceptions.ResponseError,
+        redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+    ):
+        increment_counter("del_errors")
+        return
+    if key is None:
+        increment_counter("del_empty_keyspace")
+        return
+    if key == VERIFICATION_KEY:
+        increment_counter("del_skipped_verification")
+        return
+    if only_prefix and not key.startswith(POPULATOR_KEY_PREFIX):
+        increment_counter("del_skipped_other_prefix")
+        return
+    try:
+        deleted = r.delete(key)
+        if deleted:
+            increment_counter("del_actually_deleted")
+        else:
+            increment_counter("del_missed")
+    except (
+        redis.exceptions.ResponseError,
+        redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+    ):
+        increment_counter("del_errors")
+
+
+def run_del_worker(connection_pool, mode, rate, burst, burst_interval,
+                   only_prefix, stop_event):
+    r = redis.Redis(connection_pool=connection_pool)
+
+    if mode == "rate":
+        if rate <= 0:
+            return
+        period = 1.0 / rate
+        next_tick = time.monotonic()
+        while not stop_event.is_set():
+            _attempt_del_once(r, only_prefix)
+            next_tick += period
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                # stop_event.wait wakes early on shutdown, unlike time.sleep.
+                if stop_event.wait(timeout=sleep_for):
+                    return
+            else:
+                # Fell behind schedule (Redis slow / GC pause); reset to "now"
+                # so we don't blast a runaway catch-up burst.
+                next_tick = time.monotonic()
+        return
+
+    # burst mode
+    if burst <= 0 or burst_interval <= 0:
+        return
+    while not stop_event.is_set():
+        for _ in range(burst):
+            if stop_event.is_set():
+                return
+            _attempt_del_once(r, only_prefix)
+        if stop_event.wait(timeout=burst_interval):
+            return
+
+
 # ANSI clear-to-end-of-line so the live status line repaints cleanly when the
 # rendered text shrinks (e.g. once 5-digit numbers drop back to 4).
 _CLEAR_EOL = "\033[K"
@@ -500,16 +598,27 @@ def _format_cat_summary(cats):
     return " ".join(parts)
 
 
-def print_live_status(stop_event):
+def _format_del_summary(c):
+    # Compact: del=attempts ok=actually_deleted mis=missed skp=skipped_other_prefix
+    #          vrf=skipped_verification emp=empty_keyspace err=errors
+    return (
+        f"del={c['del_attempts']} ok={c['del_actually_deleted']} "
+        f"mis={c['del_missed']} skp={c['del_skipped_other_prefix']} "
+        f"vrf={c['del_skipped_verification']} emp={c['del_empty_keyspace']} "
+        f"err={c['del_errors']}"
+    )
+
+
+def print_live_status(stop_event, show_del=False):
     cats = get_category_counters_snapshot()
     initial_cat = _format_cat_summary(cats)
-    print(
-        "\rQ:0 q/s:0 E:0 e/s:0 Z:0 D:0"
-        + (f" | {initial_cat}" if initial_cat else "")
-        + _CLEAR_EOL,
-        end="",
-        flush=True,
-    )
+    initial = "\rQ:0 q/s:0 E:0 e/s:0 Z:0 D:0"
+    if show_del:
+        initial += " | del=0 ok=0 mis=0 skp=0 vrf=0 emp=0 err=0"
+    if initial_cat:
+        initial += f" | {initial_cat}"
+    print(initial + _CLEAR_EOL, end="", flush=True)
+
     last_total = 0
     last_errors = 0
     while not stop_event.is_set():
@@ -525,6 +634,8 @@ def print_live_status(stop_event):
             f"E:{c['queries_errors']} e/s:{eps} "
             f"Z:{c['queries_zero_results']} D:{c['docs_returned']}"
         )
+        if show_del:
+            line += f" | {_format_del_summary(c)}"
         cat_str = _format_cat_summary(cats)
         if cat_str:
             line += f" | {cat_str}"
@@ -590,6 +701,37 @@ if __name__ == "__main__":
     arg_parser.add_argument("--error-log-path", default=_default_error_log, dest="error_log_path",
                             help=("Path to the recent-errors log file. Overwritten every "
                                   "~2s with the latest N error reproducers (redis-cli pasteable)."))
+
+    # --- Background DEL workload (RANDOMKEY + DEL) -------------------------
+    arg_parser.add_argument("--del", action="store_true", dest="enable_del",
+                            help=("Enable RANDOMKEY+DEL background workload. Runs in a "
+                                  "dedicated thread on a separate connection pool so it "
+                                  "never competes with FT.SEARCH workers. The verification "
+                                  "key (book_id 0) is always protected."))
+    arg_parser.add_argument("--del-mode", choices=["rate", "burst"], default="rate",
+                            dest="del_mode",
+                            help=("'rate' = sustained N deletes/sec via --del-rate; "
+                                  "'burst' = N deletes every S seconds via --del-burst "
+                                  "and --del-burst-interval."))
+    arg_parser.add_argument("--del-rate", default=1.0, type=float, dest="del_rate",
+                            help="(rate mode) Target deletes per second. Default 1.")
+    arg_parser.add_argument("--del-burst", default=10, type=int, dest="del_burst",
+                            help="(burst mode) Number of deletes per burst.")
+    arg_parser.add_argument("--del-burst-interval", default=5.0, type=float,
+                            dest="del_burst_interval",
+                            help="(burst mode) Seconds between bursts.")
+    arg_parser.add_argument("--del-only-prefix", action="store_true", default=True,
+                            dest="del_only_prefix",
+                            help=("Only delete keys with the populator's prefix "
+                                  f"('{POPULATOR_KEY_PREFIX}'). Default ON; protects "
+                                  "non-app keys that RANDOMKEY may return."))
+    arg_parser.add_argument("--no-del-only-prefix", action="store_false",
+                            dest="del_only_prefix",
+                            help=("Allow DEL on any key returned by RANDOMKEY (still "
+                                  "protects the verification key)."))
+    arg_parser.add_argument("--del-pool-size", default=2, type=int, dest="del_pool_size",
+                            help="Connection pool size for the dedicated DEL worker.")
+
     args = arg_parser.parse_args()
 
     if args.seed is not None:
@@ -620,11 +762,31 @@ if __name__ == "__main__":
         ERROR_LOG = _ErrorLog(args.error_log_size, args.error_log_path)
         print(f"Error log: {ERROR_LOG.path} (capacity={ERROR_LOG.capacity})")
 
+    if args.enable_del:
+        if args.del_mode == "rate" and args.del_rate <= 0:
+            raise SystemExit("--del-rate must be > 0 in rate mode (got "
+                             f"{args.del_rate}).")
+        if args.del_mode == "burst" and (args.del_burst <= 0 or args.del_burst_interval <= 0):
+            raise SystemExit("--del-burst and --del-burst-interval must be > 0 "
+                             "in burst mode.")
+
     print(
         f"Connecting to Redis at {args.redis_url} (pool={args.max_connections}), "
         f"workload={args.workload}, clients={args.clients}, pipeline={args.pipeline_depth}, "
         f"duration={args.duration}s, max_queries={args.max_queries}, limit={args.limit}"
     )
+    if args.enable_del:
+        if args.del_mode == "rate":
+            print(
+                f"DEL workload ENABLED: mode=rate, target={args.del_rate}/s, "
+                f"only_prefix={args.del_only_prefix}, pool={args.del_pool_size}"
+            )
+        else:
+            print(
+                f"DEL workload ENABLED: mode=burst, {args.del_burst} deletes every "
+                f"{args.del_burst_interval}s, only_prefix={args.del_only_prefix}, "
+                f"pool={args.del_pool_size}"
+            )
 
     pool = redis.ConnectionPool.from_url(
         args.redis_url, max_connections=args.max_connections, decode_responses=True
@@ -643,6 +805,13 @@ if __name__ == "__main__":
             f"Run bookHashPopulatorOnDisk.py first. ({e})"
         )
 
+    # Dedicated pool for the DEL worker so it never starves FT.SEARCH workers.
+    del_pool = None
+    if args.enable_del:
+        del_pool = redis.ConnectionPool.from_url(
+            args.redis_url, max_connections=args.del_pool_size, decode_responses=True
+        )
+
     stop_event = threading.Event()
     status_stop_event = threading.Event()
     flusher_stop_event = threading.Event()
@@ -657,7 +826,7 @@ if __name__ == "__main__":
         for i in range(args.clients)
     ]
     status_thread = threading.Thread(
-        target=print_live_status, args=(status_stop_event,),
+        target=print_live_status, args=(status_stop_event, args.enable_del),
         daemon=True, name="qg-status",
     )
     stopper_thread = threading.Thread(
@@ -668,10 +837,23 @@ if __name__ == "__main__":
         target=error_log_flusher, args=(flusher_stop_event,),
         daemon=True, name="qg-error-flusher",
     )
+    del_thread = None
+    if args.enable_del:
+        del_thread = threading.Thread(
+            target=run_del_worker,
+            args=(
+                del_pool, args.del_mode, args.del_rate,
+                args.del_burst, args.del_burst_interval,
+                args.del_only_prefix, stop_event,
+            ),
+            daemon=True, name="qg-del",
+        )
 
     status_thread.start()
     stopper_thread.start()
     flusher_thread.start()
+    if del_thread is not None:
+        del_thread.start()
     for w in workers:
         w.start()
 
@@ -689,6 +871,8 @@ if __name__ == "__main__":
     flusher_stop_event.set()
     flusher_thread.join(timeout=2)
     stopper_thread.join(timeout=2)
+    if del_thread is not None:
+        del_thread.join(timeout=2)
 
     if ERROR_LOG is not None:
         ERROR_LOG.flush()
@@ -712,6 +896,15 @@ if __name__ == "__main__":
                 f"  {name.ljust(col_w)}  {c['total']:>10d}  {c['errors']:>8d}  "
                 f"{c['zero']:>8d}  {c['docs']:>10d}"
             )
+    if args.enable_del:
+        print("\nDEL Summary")
+        print(f"  Attempts:                   {final['del_attempts']}")
+        print(f"  Actually deleted:           {final['del_actually_deleted']}")
+        print(f"  Missed (already gone):      {final['del_missed']}")
+        print(f"  Skipped (verification key): {final['del_skipped_verification']}")
+        print(f"  Skipped (other prefix):     {final['del_skipped_other_prefix']}")
+        print(f"  Empty keyspace (no key):    {final['del_empty_keyspace']}")
+        print(f"  Errors:                     {final['del_errors']}")
     if ERROR_LOG is not None:
         print(
             f"\nError log: {ERROR_LOG.path} "
