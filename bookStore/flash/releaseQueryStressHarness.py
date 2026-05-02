@@ -70,6 +70,7 @@ def load_schema(r: redis.Redis) -> Schema:
 class Vocabulary:
     text_tokens: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
     tag_values: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
+    guaranteed_clauses: List[str] = field(default_factory=list)
     sampled_keys: int = 0
 
 
@@ -107,6 +108,24 @@ def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int) -> Vocabulary:
     for field in schema.tag_fields:
         if not vocab.tag_values[field]:
             vocab.tag_values[field] = ["unknown"]
+
+    preferred_hit_fields = ("status", "format", "is_available")
+    for field in preferred_hit_fields:
+        values = vocab.tag_values.get(field, [])
+        if values:
+            uniq = list(dict.fromkeys(values))[:8]
+            clause = f"@{field}:{{{'|'.join(esc_tag(v) for v in uniq)}}}"
+            vocab.guaranteed_clauses.append(clause)
+
+    if not vocab.guaranteed_clauses:
+        # Fallback: use any tag field with known values.
+        for field, values in vocab.tag_values.items():
+            if values:
+                uniq = list(dict.fromkeys(values))[:8]
+                clause = f"@{field}:{{{'|'.join(esc_tag(v) for v in uniq)}}}"
+                vocab.guaranteed_clauses.append(clause)
+                break
+
     return vocab
 
 
@@ -119,16 +138,48 @@ def pick_tag(vocab: Vocabulary, field: str, rnd: random.Random) -> str:
     return esc_tag(rnd.choice(vocab.tag_values[field]))
 
 
+def text_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
+    field = rnd.choice(schema.text_fields)
+    token = pick_text(vocab, field, rnd)
+    flavor = rnd.choices(
+        ["plain", "prefix", "fuzzy", "phrase"],
+        weights=[45, 25, 15, 15],
+        k=1,
+    )[0]
+    if flavor == "plain":
+        expr = token
+    elif flavor == "prefix":
+        expr = (token[: max(2, len(token) // 2)] or token) + "*"
+    elif flavor == "fuzzy":
+        expr = f"%{token}%"
+    else:
+        token2 = pick_text(vocab, field, rnd)
+        expr = f'"{token} {token2}"'
+    return f"@{field}:{expr}"
+
+
+def tag_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
+    field = rnd.choice(list(schema.tag_fields))
+    values = vocab.tag_values[field]
+    n_values = rnd.randint(1, min(3, len(values)))
+    chosen = rnd.sample(values, k=n_values) if len(values) >= n_values else [rnd.choice(values)]
+    return f"@{field}:{{{'|'.join(esc_tag(v) for v in chosen)}}}"
+
+
+def build_complex_query(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
+    t1, t2, t3, t4 = [text_atom(schema, vocab, rnd) for _ in range(4)]
+    g1, g2, g3, g4 = [tag_atom(schema, vocab, rnd) for _ in range(4)]
+    guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd)
+
+    branch_left = f"(({t1} {g1})|({t2} {g2} ~{t3}))"
+    branch_right = f"(({g3}|{t4}) -{g4})"
+    core = f"({branch_left} {branch_right})"
+    # Ensure non-empty responses by keeping one broad, known-good disjunction branch.
+    return f"({core}|({guarantee}))"
+
+
 def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
-    tf = rnd.choice(schema.text_fields)
-    tf2 = rnd.choice(schema.text_fields)
-    tg = rnd.choice(list(schema.tag_fields))
-    tg2 = rnd.choice(list(schema.tag_fields))
-    q = (
-        f"((@{tf}:{pick_text(vocab, tf, rnd)}|@{tf2}:{pick_text(vocab, tf2, rnd)}*) "
-        f"@{tg}:{{{pick_tag(vocab, tg, rnd)}|{pick_tag(vocab, tg, rnd)}}} "
-        f"-@{tg2}:{{{pick_tag(vocab, tg2, rnd)}}})"
-    )
+    q = build_complex_query(schema, vocab, rnd)
     offset = rnd.choice([0, 10, 100, 300])
     limit = rnd.choice([10, 50, 100])
     cmd = ["FT.SEARCH", INDEX_NAME, q]
@@ -145,21 +196,38 @@ def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[s
 
 
 def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
-    group_field = rnd.choice(list(schema.tag_fields))
-    filter_field = rnd.choice(list(schema.tag_fields))
-    q = f"@{filter_field}:{{{pick_tag(vocab, filter_field, rnd)}|{pick_tag(vocab, filter_field, rnd)}}}"
+    tag_fields = list(schema.tag_fields)
+    if len(tag_fields) >= 2:
+        group_field, group_field_2 = rnd.sample(tag_fields, k=2)
+    else:
+        group_field = group_field_2 = tag_fields[0]
+    distinct_field = rnd.choice(tag_fields)
+    q = build_complex_query(schema, vocab, rnd)
+    load_1 = rnd.choice(tag_fields)
+    load_2 = rnd.choice(schema.text_fields)
     cmd = [
         "FT.AGGREGATE",
         INDEX_NAME,
         q,
+        "LOAD",
+        "2",
+        f"@{load_1}",
+        f"@{load_2}",
         "GROUPBY",
-        "1",
+        "2",
         f"@{group_field}",
+        f"@{group_field_2}",
         "REDUCE",
         "COUNT",
         "0",
         "AS",
         "cnt",
+        "REDUCE",
+        "COUNT_DISTINCT",
+        "1",
+        f"@{distinct_field}",
+        "AS",
+        "uniq",
         "SORTBY",
         "2",
         "@cnt",
@@ -178,8 +246,7 @@ def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> Lis
 
 
 def make_profile(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
-    sf = rnd.choice(schema.text_fields)
-    q = f"@{sf}:{pick_text(vocab, sf, rnd)}"
+    q = build_complex_query(schema, vocab, rnd)
     return [
         "FT.PROFILE",
         INDEX_NAME,
@@ -207,6 +274,7 @@ def op_name(cmd: List[str]) -> str:
 class Stats:
     total: int = 0
     hits: int = 0
+    non_empty_hits: int = 0
     errors: int = 0
     op_counts: Counter = field(default_factory=Counter)
     op_errors: Counter = field(default_factory=Counter)
@@ -220,6 +288,8 @@ class Stats:
             self.op_counts[op] += 1
             self.latencies[op].append(latency_ms)
             self.hits += hits
+            if ok and hits > 0:
+                self.non_empty_hits += 1
             if not ok:
                 self.errors += 1
                 self.op_errors[op] += 1
@@ -375,6 +445,8 @@ def main() -> int:
             "errors": stats.errors,
             "error_rate": round((stats.errors / stats.total) if stats.total else 0.0, 6),
             "total_hits": stats.hits,
+            "non_empty_responses": stats.non_empty_hits,
+            "non_empty_response_rate": round((stats.non_empty_hits / stats.total) if stats.total else 0.0, 6),
             "qps": round(stats.total / elapsed, 2) if elapsed else 0.0,
         },
         "per_operation": {},
