@@ -30,6 +30,20 @@ SCORERS = ["BM25", "TFIDF", "DISMAX"]
 LANGUAGES = ["english", "german", "french", "spanish"]
 
 
+@dataclass
+class RuntimeTuning:
+    depth_min: int = 2
+    depth_max: int = 4
+    child_min: int = 2
+    child_max: int = 4
+    search_weight: int = 72
+    aggregate_weight: int = 20
+    profile_weight: int = 8
+
+
+RUNTIME_TUNING = RuntimeTuning()
+
+
 def esc_tag(value: str) -> str:
     return ESCAPE_RE.sub(r"\\\1", value)
 
@@ -175,7 +189,14 @@ def tag_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
     return f"@{field}:{{{'|'.join(esc_tag(v) for v in chosen)}}}"
 
 
-def build_query_node(schema: Schema, vocab: Vocabulary, rnd: random.Random, depth: int) -> str:
+def build_query_node(
+    schema: Schema,
+    vocab: Vocabulary,
+    rnd: random.Random,
+    depth: int,
+    min_children: int,
+    max_children: int,
+) -> str:
     if depth <= 0:
         atom = text_atom(schema, vocab, rnd) if rnd.random() < 0.6 else tag_atom(schema, vocab, rnd)
         roll = rnd.random()
@@ -185,25 +206,48 @@ def build_query_node(schema: Schema, vocab: Vocabulary, rnd: random.Random, dept
             return f"~{atom}"
         return atom
 
-    child_count = rnd.randint(2, 4)
-    children = [build_query_node(schema, vocab, rnd, depth - 1) for _ in range(child_count)]
+    lo = max(2, min_children)
+    hi = max(lo, max_children)
+    child_count = rnd.randint(lo, hi)
+    children = [
+        build_query_node(schema, vocab, rnd, depth - 1, min_children, max_children)
+        for _ in range(child_count)
+    ]
     if rnd.random() < 0.5:
         return "(" + " ".join(children) + ")"
     return "(" + "|".join(children) + ")"
 
 
-def build_complex_query(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
-    depth = rnd.choice([2, 3, 3, 4])
-    core = build_query_node(schema, vocab, rnd, depth)
-    secondary = build_query_node(schema, vocab, rnd, max(1, depth - 1))
+def build_complex_query(
+    schema: Schema,
+    vocab: Vocabulary,
+    rnd: random.Random,
+    min_depth: int,
+    max_depth: int,
+    min_children: int,
+    max_children: int,
+) -> str:
+    lo_d = max(1, min_depth)
+    hi_d = max(lo_d, max_depth)
+    depth = rnd.randint(lo_d, hi_d)
+    core = build_query_node(schema, vocab, rnd, depth, min_children, max_children)
+    secondary = build_query_node(schema, vocab, rnd, max(1, depth - 1), min_children, max_children)
     guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd)
     # Keep complexity high but always provide a likely-hit branch to keep the server
     # returning data during sustained stress.
     return f"((({core} {secondary})|({secondary} -{tag_atom(schema, vocab, rnd)}))|({guarantee}))"
 
 
-def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
-    q = build_complex_query(schema, vocab, rnd)
+def make_search(
+    schema: Schema,
+    vocab: Vocabulary,
+    rnd: random.Random,
+    min_depth: int,
+    max_depth: int,
+    min_children: int,
+    max_children: int,
+) -> List[str]:
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
     offset = rnd.choice([0, 10, 100, 300, 500, 1000])
     limit = rnd.choice([10, 50, 100, 200])
     cmd = ["FT.SEARCH", INDEX_NAME, q]
@@ -247,7 +291,15 @@ def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[s
     return cmd
 
 
-def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
+def make_aggregate(
+    schema: Schema,
+    vocab: Vocabulary,
+    rnd: random.Random,
+    min_depth: int,
+    max_depth: int,
+    min_children: int,
+    max_children: int,
+) -> List[str]:
     tag_fields = list(schema.tag_fields)
     if len(tag_fields) >= 3:
         group_field, group_field_2, group_field_3 = rnd.sample(tag_fields, k=3)
@@ -258,7 +310,7 @@ def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> Lis
         group_field = group_field_2 = group_field_3 = tag_fields[0]
     distinct_candidates = [f for f in tag_fields if f not in {group_field, group_field_2, group_field_3}]
     distinct_field = rnd.choice(distinct_candidates) if distinct_candidates else rnd.choice(tag_fields)
-    q = build_complex_query(schema, vocab, rnd)
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
     scalar_tag_fields = [f for f, sep in schema.tag_fields.items() if sep == ","]
     apply_src = rnd.choice(scalar_tag_fields) if scalar_tag_fields else group_field
     required_fields = {group_field, group_field_2, group_field_3, distinct_field, apply_src}
@@ -314,8 +366,16 @@ def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> Lis
     return cmd
 
 
-def make_profile(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
-    q = build_complex_query(schema, vocab, rnd)
+def make_profile(
+    schema: Schema,
+    vocab: Vocabulary,
+    rnd: random.Random,
+    min_depth: int,
+    max_depth: int,
+    min_children: int,
+    max_children: int,
+) -> List[str]:
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
     return [
         "FT.PROFILE",
         INDEX_NAME,
@@ -407,16 +467,21 @@ def worker(
     stats: Stats,
     stop_event: threading.Event,
     seed: int,
+    min_depth: int,
+    max_depth: int,
+    min_children: int,
+    max_children: int,
+    op_weights: Tuple[int, int, int],
 ) -> None:
     rnd = random.Random(seed)
     r = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=socket_timeout, socket_connect_timeout=8)
     while not stop_event.is_set():
         maker = rnd.choices(
             [make_search, make_aggregate, make_profile],
-            weights=[72, 20, 8],
+            weights=list(op_weights),
             k=1,
         )[0]
-        cmd = maker(schema, vocab, rnd)
+        cmd = maker(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
         op = op_name(cmd)
         t0 = time.monotonic()
         ok, err = True, None
@@ -463,7 +528,25 @@ def main() -> int:
     parser.add_argument("--status-interval", type=int, default=5)
     parser.add_argument("--report-file", default="stress-report.json")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--min-depth", type=int, default=2, help="Minimum recursive query-tree depth")
+    parser.add_argument("--max-depth", type=int, default=4, help="Maximum recursive query-tree depth")
+    parser.add_argument("--min-children", type=int, default=2, help="Minimum boolean children per recursive node")
+    parser.add_argument("--max-children", type=int, default=4, help="Maximum boolean children per recursive node")
+    parser.add_argument("--search-weight", type=int, default=72, help="Relative weight for FT.SEARCH generation")
+    parser.add_argument("--aggregate-weight", type=int, default=20, help="Relative weight for FT.AGGREGATE generation")
+    parser.add_argument("--profile-weight", type=int, default=8, help="Relative weight for FT.PROFILE generation")
     args = parser.parse_args()
+
+    min_depth = max(1, args.min_depth)
+    max_depth = max(min_depth, args.max_depth)
+    min_children = max(2, args.min_children)
+    max_children = max(min_children, args.max_children)
+    search_w = max(0, args.search_weight)
+    aggregate_w = max(0, args.aggregate_weight)
+    profile_w = max(0, args.profile_weight)
+    if search_w + aggregate_w + profile_w == 0:
+        search_w = 1
+    op_weights = (search_w, aggregate_w, profile_w)
 
     r = redis.Redis.from_url(args.redis_url, decode_responses=True, socket_timeout=args.socket_timeout, socket_connect_timeout=8)
     if not r.ping():
@@ -479,7 +562,20 @@ def main() -> int:
     threads = [
         threading.Thread(
             target=worker,
-            args=(args.redis_url, args.socket_timeout, schema, vocab, stats, stop_event, args.seed + i),
+            args=(
+                args.redis_url,
+                args.socket_timeout,
+                schema,
+                vocab,
+                stats,
+                stop_event,
+                args.seed + i,
+                min_depth,
+                max_depth,
+                min_children,
+                max_children,
+                op_weights,
+            ),
             daemon=True,
             name=f"stress-{i}",
         )
@@ -528,6 +624,15 @@ def main() -> int:
             "non_empty_responses": stats.non_empty_hits,
             "non_empty_response_rate": round((stats.non_empty_hits / stats.total) if stats.total else 0.0, 6),
             "qps": round(stats.total / elapsed, 2) if elapsed else 0.0,
+        },
+        "settings": {
+            "min_depth": min_depth,
+            "max_depth": max_depth,
+            "min_children": min_children,
+            "max_children": max_children,
+            "search_weight": search_w,
+            "aggregate_weight": aggregate_w,
+            "profile_weight": profile_w,
         },
         "per_operation": {},
         "top_errors": stats.error_buckets.most_common(15),
