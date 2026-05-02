@@ -1,0 +1,131 @@
+{
+  "redis_url": "redis://108.130.19.251:6379",
+  "index": "idx:books",
+  "elapsed_sec": 30.09,
+  "threads": 10,
+  "schema": {
+    "num_docs": 3914,
+    "text_fields": [
+      "author",
+      "description",
+      "title",
+      "publisher",
+      "book_series",
+      "main_character",
+      "location",
+      "address"
+    ],
+    "tag_fields": {
+      "id": ",",
+      "editions": "|",
+      "genres": "|",
+      "pages": ",",
+      "year_published": ",",
+      "rating_votes": ",",
+      "score": ",",
+      "status": "|",
+      "stock_id": "|",
+      "format": ",",
+      "is_available": ",",
+      "price": ",",
+      "isbn": ",",
+      "geo": "|",
+      "edition_number": ",",
+      "chapter_count": ",",
+      "review_count": ",",
+      "citation_count": ",",
+      "publishing_delay": ",",
+      "word_count": ",",
+      "timestamp": ",",
+      "reading_time_minutes": ",",
+      "global_sales": ",",
+      "translations_count": ",",
+      "author_age_at_publication": ",",
+      "weight_grams": ",",
+      "width_cm": ",",
+      "height_cm": ",",
+      "depth_cm": ","
+    },
+    "prefixes": [
+      "alon:shmuely:redis:data:store:application:"
+    ]
+  },
+  "vocabulary": {
+    "sampled_keys": 500,
+    "text_field_pool_sizes": {
+      "author": 120,
+      "description": 120,
+      "title": 120,
+      "publisher": 120,
+      "book_series": 120,
+      "main_character": 120,
+      "location": 120,
+      "address": 120
+    },
+    "tag_field_pool_sizes": {
+      "id": 200,
+      "editions": 35,
+      "genres": 30,
+      "pages": 200,
+      "year_published": 124,
+      "rating_votes": 200,
+      "score": 200,
+      "status": 4,
+      "stock_id": 200,
+      "format": 3,
+      "is_available": 2,
+      "price": 200,
+      "isbn": 200,
+      "geo": 200,
+      "edition_number": 10,
+      "chapter_count": 46,
+      "review_count": 200,
+      "citation_count": 200,
+      "publishing_delay": 200,
+      "word_count": 200,
+      "timestamp": 200,
+      "reading_time_minutes": 200,
+      "global_sales": 200,
+      "translations_count": 50,
+      "author_age_at_publication": 61,
+      "weight_grams": 200,
+      "width_cm": 200,
+      "height_cm": 200,
+      "depth_cm": 200
+    }
+  },
+  "totals": {
+    "queries": 3140,
+    "errors": 0,
+    "error_rate": 0.0,
+    "total_hits": 109619,
+    "qps": 104.35
+  },
+  "per_operation": {
+    "FT.SEARCH": {
+      "count": 1867,
+      "errors": 0,
+      "p50_ms": 83.325,
+      "p95_ms": 134.326,
+      "p99_ms": 148.573,
+      "max_ms": 319.35
+    },
+    "FT.AGGREGATE": {
+      "count": 971,
+      "errors": 0,
+      "p50_ms": 86.464,
+      "p95_ms": 185.273,
+      "p99_ms": 310.695,
+      "max_ms": 384.182
+    },
+    "FT.PROFILE.SEARCH": {
+      "count": 302,
+      "errors": 0,
+      "p50_ms": 86.206,
+      "p95_ms": 151.272,
+      "p99_ms": 177.073,
+      "max_ms": 284.295
+    }
+  },
+  "top_errors": []
+}
