@@ -26,6 +26,8 @@ INDEX_NAME = "idx:books"
 DEFAULT_PREFIX = "alon:shmuely:redis:data:store:application:"
 ESCAPE_RE = re.compile(r"([,.<>{}\[\]\"':;!@#$%^&*()\-+=~|/\\? \t\n])")
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
+SCORERS = ["BM25", "TFIDF", "DISMAX"]
+LANGUAGES = ["english", "german", "french", "spanish"]
 
 
 def esc_tag(value: str) -> str:
@@ -72,6 +74,7 @@ class Vocabulary:
     tag_values: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
     guaranteed_clauses: List[str] = field(default_factory=list)
     sampled_keys: int = 0
+    sampled_key_list: List[str] = field(default_factory=list)
 
 
 def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int) -> Vocabulary:
@@ -89,6 +92,8 @@ def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int) -> Vocabulary:
         if i >= sample_docs:
             break
         vocab.sampled_keys += 1
+        if len(vocab.sampled_key_list) < 1000:
+            vocab.sampled_key_list.append(str(key))
         try:
             data = r.hgetall(key)
         except redis.exceptions.ResponseError:
@@ -142,8 +147,8 @@ def text_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
     field = rnd.choice(schema.text_fields)
     token = pick_text(vocab, field, rnd)
     flavor = rnd.choices(
-        ["plain", "prefix", "fuzzy", "phrase"],
-        weights=[45, 25, 15, 15],
+        ["plain", "prefix", "fuzzy", "phrase", "weighted"],
+        weights=[35, 20, 15, 15, 15],
         k=1,
     )[0]
     if flavor == "plain":
@@ -152,9 +157,13 @@ def text_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
         expr = (token[: max(2, len(token) // 2)] or token) + "*"
     elif flavor == "fuzzy":
         expr = f"%{token}%"
-    else:
+    elif flavor == "phrase":
         token2 = pick_text(vocab, field, rnd)
         expr = f'"{token} {token2}"'
+    else:
+        # Weighted text clauses exercise expression attribute handling.
+        weight = round(rnd.uniform(0.1, 4.5), 2)
+        return f"(@{field}:{token} => {{ $weight: {weight} }})"
     return f"@{field}:{expr}"
 
 
@@ -166,30 +175,73 @@ def tag_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
     return f"@{field}:{{{'|'.join(esc_tag(v) for v in chosen)}}}"
 
 
-def build_complex_query(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
-    t1, t2, t3, t4 = [text_atom(schema, vocab, rnd) for _ in range(4)]
-    g1, g2, g3, g4 = [tag_atom(schema, vocab, rnd) for _ in range(4)]
-    guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd)
+def build_query_node(schema: Schema, vocab: Vocabulary, rnd: random.Random, depth: int) -> str:
+    if depth <= 0:
+        atom = text_atom(schema, vocab, rnd) if rnd.random() < 0.6 else tag_atom(schema, vocab, rnd)
+        roll = rnd.random()
+        if roll < 0.2:
+            return f"-{atom}"
+        if roll < 0.35 and atom.startswith("@"):
+            return f"~{atom}"
+        return atom
 
-    branch_left = f"(({t1} {g1})|({t2} {g2} ~{t3}))"
-    branch_right = f"(({g3}|{t4}) -{g4})"
-    core = f"({branch_left} {branch_right})"
-    # Ensure non-empty responses by keeping one broad, known-good disjunction branch.
-    return f"({core}|({guarantee}))"
+    child_count = rnd.randint(2, 4)
+    children = [build_query_node(schema, vocab, rnd, depth - 1) for _ in range(child_count)]
+    if rnd.random() < 0.5:
+        return "(" + " ".join(children) + ")"
+    return "(" + "|".join(children) + ")"
+
+
+def build_complex_query(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
+    depth = rnd.choice([2, 3, 3, 4])
+    core = build_query_node(schema, vocab, rnd, depth)
+    secondary = build_query_node(schema, vocab, rnd, max(1, depth - 1))
+    guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd)
+    # Keep complexity high but always provide a likely-hit branch to keep the server
+    # returning data during sustained stress.
+    return f"((({core} {secondary})|({secondary} -{tag_atom(schema, vocab, rnd)}))|({guarantee}))"
 
 
 def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
     q = build_complex_query(schema, vocab, rnd)
-    offset = rnd.choice([0, 10, 100, 300])
-    limit = rnd.choice([10, 50, 100])
+    offset = rnd.choice([0, 10, 100, 300, 500, 1000])
+    limit = rnd.choice([10, 50, 100, 200])
     cmd = ["FT.SEARCH", INDEX_NAME, q]
     if rnd.random() < 0.5:
         cmd += ["NOCONTENT"]
     else:
-        ret = rnd.sample(schema.text_fields + list(schema.tag_fields), k=min(6, len(schema.text_fields) + len(schema.tag_fields)))
+        ret = rnd.sample(
+            schema.text_fields + list(schema.tag_fields),
+            k=min(10, len(schema.text_fields) + len(schema.tag_fields)),
+        )
         cmd += ["RETURN", str(len(ret))] + ret
-    if rnd.random() < 0.4:
+    if rnd.random() < 0.55:
         cmd += ["WITHSCORES"]
+        if rnd.random() < 0.35:
+            cmd += ["EXPLAINSCORE"]
+    if rnd.random() < 0.3:
+        cmd += ["WITHCOUNT"]
+    if rnd.random() < 0.3:
+        cmd += ["VERBATIM"]
+    if rnd.random() < 0.2:
+        cmd += ["NOSTOPWORDS"]
+    if rnd.random() < 0.35 and schema.text_fields:
+        chosen = rnd.sample(schema.text_fields, k=rnd.randint(1, min(4, len(schema.text_fields))))
+        cmd += ["INFIELDS", str(len(chosen))] + chosen
+    if rnd.random() < 0.2 and vocab.sampled_key_list:
+        # INKEYS increases iterator pressure and can expose key-filter regressions.
+        keys = rnd.sample(vocab.sampled_key_list, k=min(rnd.randint(1, 4), len(vocab.sampled_key_list)))
+        cmd += ["INKEYS", str(len(keys))] + keys
+    if rnd.random() < 0.35:
+        sort_field = rnd.choice(list(schema.tag_fields))
+        direction = rnd.choice(["ASC", "DESC"])
+        cmd += ["SORTBY", sort_field, direction]
+    if rnd.random() < 0.2:
+        cmd += ["SCORER", rnd.choice(SCORERS)]
+    if rnd.random() < 0.2:
+        cmd += ["SLOP", str(rnd.randint(0, 8))]
+    if rnd.random() < 0.15:
+        cmd += ["LANGUAGE", rnd.choice(LANGUAGES)]
     cmd += ["TIMEOUT", str(rnd.choice([500, 1000, 2000, 5000]))]
     cmd += ["LIMIT", str(offset), str(limit), "DIALECT", str(rnd.choice([2, 3, 4]))]
     return cmd
@@ -197,26 +249,35 @@ def make_search(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[s
 
 def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[str]:
     tag_fields = list(schema.tag_fields)
-    if len(tag_fields) >= 2:
+    if len(tag_fields) >= 3:
+        group_field, group_field_2, group_field_3 = rnd.sample(tag_fields, k=3)
+    elif len(tag_fields) >= 2:
         group_field, group_field_2 = rnd.sample(tag_fields, k=2)
+        group_field_3 = group_field
     else:
-        group_field = group_field_2 = tag_fields[0]
-    distinct_field = rnd.choice(tag_fields)
+        group_field = group_field_2 = group_field_3 = tag_fields[0]
+    distinct_candidates = [f for f in tag_fields if f not in {group_field, group_field_2, group_field_3}]
+    distinct_field = rnd.choice(distinct_candidates) if distinct_candidates else rnd.choice(tag_fields)
     q = build_complex_query(schema, vocab, rnd)
-    load_1 = rnd.choice(tag_fields)
-    load_2 = rnd.choice(schema.text_fields)
+    scalar_tag_fields = [f for f, sep in schema.tag_fields.items() if sep == ","]
+    apply_src = rnd.choice(scalar_tag_fields) if scalar_tag_fields else group_field
+    required_fields = {group_field, group_field_2, group_field_3, distinct_field, apply_src}
+    candidate_fields = schema.text_fields + tag_fields
+    extra_count = min(4, len(candidate_fields))
+    extras = rnd.sample(candidate_fields, k=extra_count)
+    load_fields = sorted(set(extras) | required_fields)
     cmd = [
         "FT.AGGREGATE",
         INDEX_NAME,
         q,
         "LOAD",
-        "2",
-        f"@{load_1}",
-        f"@{load_2}",
+        str(len(load_fields)),
+    ] + [f"@{f}" for f in load_fields] + [
         "GROUPBY",
-        "2",
+        "3",
         f"@{group_field}",
         f"@{group_field_2}",
+        f"@{group_field_3}",
         "REDUCE",
         "COUNT",
         "0",
@@ -228,13 +289,21 @@ def make_aggregate(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> Lis
         f"@{distinct_field}",
         "AS",
         "uniq",
+        "APPLY",
+        "abs(@cnt-@uniq)",
+        "AS",
+        "spread",
+        "FILTER",
+        "@cnt > 0",
         "SORTBY",
-        "2",
+        "4",
         "@cnt",
+        "DESC",
+        "@uniq",
         "DESC",
         "LIMIT",
         "0",
-        str(rnd.choice([20, 50, 100])),
+        str(rnd.choice([20, 50, 100, 200])),
         "TIMEOUT",
         str(rnd.choice([1000, 2000, 5000])),
         "DIALECT",
@@ -255,7 +324,7 @@ def make_profile(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> List[
         q,
         "LIMIT",
         "0",
-        "20",
+        "50",
         "TIMEOUT",
         str(rnd.choice([1000, 2000, 5000])),
         "DIALECT",
@@ -280,14 +349,25 @@ class Stats:
     op_errors: Counter = field(default_factory=Counter)
     latencies: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
     error_buckets: Counter = field(default_factory=Counter)
+    sample_queries: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def add(self, op: str, latency_ms: float, ok: bool, hits: int, err: Optional[str]) -> None:
+    def add(
+        self,
+        op: str,
+        latency_ms: float,
+        ok: bool,
+        hits: int,
+        err: Optional[str],
+        cmd: Optional[List[str]] = None,
+    ) -> None:
         with self.lock:
             self.total += 1
             self.op_counts[op] += 1
             self.latencies[op].append(latency_ms)
             self.hits += hits
+            if cmd is not None and len(self.sample_queries[op]) < 8:
+                self.sample_queries[op].append(" ".join(str(x) for x in cmd))
             if ok and hits > 0:
                 self.non_empty_hits += 1
             if not ok:
@@ -333,7 +413,7 @@ def worker(
     while not stop_event.is_set():
         maker = rnd.choices(
             [make_search, make_aggregate, make_profile],
-            weights=[60, 30, 10],
+            weights=[72, 20, 8],
             k=1,
         )[0]
         cmd = maker(schema, vocab, rnd)
@@ -362,7 +442,7 @@ def worker(
         except Exception as exc:  # noqa: BLE001
             ok = False
             err = f"{type(exc).__name__}: {exc}"
-        stats.add(op, (time.monotonic() - t0) * 1000.0, ok, hits, err)
+        stats.add(op, (time.monotonic() - t0) * 1000.0, ok, hits, err, cmd=cmd)
 
 
 def percentile(values: List[float], p: float) -> float:
@@ -451,6 +531,7 @@ def main() -> int:
         },
         "per_operation": {},
         "top_errors": stats.error_buckets.most_common(15),
+        "sample_queries": {op: q for op, q in stats.sample_queries.items()},
     }
 
     for op, count in stats.op_counts.items():
