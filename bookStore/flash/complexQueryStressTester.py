@@ -445,13 +445,12 @@ class QueryFactory:
                 size = self.rnd.randint(1, 5)
                 cmd += ["REDUCE", "RANDOM_SAMPLE", "2", "@" + fld, str(size), "AS", alias]
 
-        # Optional APPLY (post-group) using a string function. String
-        # functions in FT.AGGREGATE only work on scalar values, so we need to
-        # use a TEXT field or a single-value (",") TAG field, never a
-        # multi-value ("|") TAG field.
-        scalar_string_fields = self.schema.text_fields + self.schema.scalar_tag_fields
-        if self.rnd.random() < 0.5 and scalar_string_fields:
-            string_field = self.rnd.choice(scalar_string_fields)
+        # Optional APPLY (post-group) using a string function. After
+        # GROUPBY, only the group key and reducer aliases survive in the
+        # pipeline; referencing any other field yields SEARCH_PROP_NOT_FOUND.
+        # We also need a scalar string (multi-value TAGs break substr/upper).
+        if self.rnd.random() < 0.5 and group_field in self.schema.scalar_tag_fields:
+            string_field = group_field
             expr = self.rnd.choice([
                 f"upper(@{string_field})",
                 f"lower(@{string_field})",
