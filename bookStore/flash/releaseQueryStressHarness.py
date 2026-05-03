@@ -91,7 +91,7 @@ class Vocabulary:
     sampled_key_list: List[str] = field(default_factory=list)
 
 
-def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int) -> Vocabulary:
+def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int, no_geo: bool = False) -> Vocabulary:
     vocab = Vocabulary()
 
     for field in schema.tag_fields:
@@ -139,6 +139,8 @@ def build_vocab(r: redis.Redis, schema: Schema, sample_docs: int) -> Vocabulary:
     if not vocab.guaranteed_clauses:
         # Fallback: use any tag field with known values.
         for field, values in vocab.tag_values.items():
+            if no_geo and field == "geo":
+                continue
             if values:
                 uniq = list(dict.fromkeys(values))[:8]
                 clause = f"@{field}:{{{'|'.join(esc_tag(v) for v in uniq)}}}"
@@ -155,6 +157,13 @@ def pick_text(vocab: Vocabulary, field: str, rnd: random.Random) -> str:
 
 def pick_tag(vocab: Vocabulary, field: str, rnd: random.Random) -> str:
     return esc_tag(rnd.choice(vocab.tag_values[field]))
+
+
+def effective_tag_fields(schema: Schema, no_geo: bool) -> List[str]:
+    fields = [f for f in schema.tag_fields if not (no_geo and f == "geo")]
+    if not fields:
+        raise RuntimeError("No TAG fields available for query generation after applying --no-geo")
+    return fields
 
 
 def text_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
@@ -535,6 +544,7 @@ def main() -> int:
     parser.add_argument("--search-weight", type=int, default=72, help="Relative weight for FT.SEARCH generation")
     parser.add_argument("--aggregate-weight", type=int, default=20, help="Relative weight for FT.AGGREGATE generation")
     parser.add_argument("--profile-weight", type=int, default=8, help="Relative weight for FT.PROFILE generation")
+    parser.add_argument("--no-geo", action="store_true", help="Disable query generation on geo field")
     args = parser.parse_args()
 
     min_depth = max(1, args.min_depth)
@@ -555,7 +565,7 @@ def main() -> int:
     schema = load_schema(r)
     if not schema.text_fields or not schema.tag_fields:
         raise RuntimeError("Schema missing TEXT or TAG fields; cannot build complex query mix")
-    vocab = build_vocab(r, schema, args.sample_docs)
+    vocab = build_vocab(r, schema, args.sample_docs, no_geo=args.no_geo)
 
     stats = Stats()
     stop_event = threading.Event()
@@ -575,6 +585,7 @@ def main() -> int:
                 min_children,
                 max_children,
                 op_weights,
+                args.no_geo,
             ),
             daemon=True,
             name=f"stress-{i}",
