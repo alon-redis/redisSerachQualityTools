@@ -190,8 +190,8 @@ def text_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
     return f"@{field}:{expr}"
 
 
-def tag_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random) -> str:
-    field = rnd.choice(list(schema.tag_fields))
+def tag_atom(schema: Schema, vocab: Vocabulary, rnd: random.Random, no_geo: bool = False) -> str:
+    field = rnd.choice(effective_tag_fields(schema, no_geo))
     values = vocab.tag_values[field]
     n_values = rnd.randint(1, min(3, len(values)))
     chosen = rnd.sample(values, k=n_values) if len(values) >= n_values else [rnd.choice(values)]
@@ -205,9 +205,10 @@ def build_query_node(
     depth: int,
     min_children: int,
     max_children: int,
+    no_geo: bool = False,
 ) -> str:
     if depth <= 0:
-        atom = text_atom(schema, vocab, rnd) if rnd.random() < 0.6 else tag_atom(schema, vocab, rnd)
+        atom = text_atom(schema, vocab, rnd) if rnd.random() < 0.6 else tag_atom(schema, vocab, rnd, no_geo=no_geo)
         roll = rnd.random()
         if roll < 0.2:
             return f"-{atom}"
@@ -219,7 +220,7 @@ def build_query_node(
     hi = max(lo, max_children)
     child_count = rnd.randint(lo, hi)
     children = [
-        build_query_node(schema, vocab, rnd, depth - 1, min_children, max_children)
+        build_query_node(schema, vocab, rnd, depth - 1, min_children, max_children, no_geo=no_geo)
         for _ in range(child_count)
     ]
     if rnd.random() < 0.5:
@@ -235,16 +236,17 @@ def build_complex_query(
     max_depth: int,
     min_children: int,
     max_children: int,
+    no_geo: bool = False,
 ) -> str:
     lo_d = max(1, min_depth)
     hi_d = max(lo_d, max_depth)
     depth = rnd.randint(lo_d, hi_d)
-    core = build_query_node(schema, vocab, rnd, depth, min_children, max_children)
-    secondary = build_query_node(schema, vocab, rnd, max(1, depth - 1), min_children, max_children)
-    guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd)
+    core = build_query_node(schema, vocab, rnd, depth, min_children, max_children, no_geo=no_geo)
+    secondary = build_query_node(schema, vocab, rnd, max(1, depth - 1), min_children, max_children, no_geo=no_geo)
+    guarantee = rnd.choice(vocab.guaranteed_clauses) if vocab.guaranteed_clauses else tag_atom(schema, vocab, rnd, no_geo=no_geo)
     # Keep complexity high but always provide a likely-hit branch to keep the server
     # returning data during sustained stress.
-    return f"((({core} {secondary})|({secondary} -{tag_atom(schema, vocab, rnd)}))|({guarantee}))"
+    return f"((({core} {secondary})|({secondary} -{tag_atom(schema, vocab, rnd, no_geo=no_geo)}))|({guarantee}))"
 
 
 def make_search(
@@ -255,17 +257,19 @@ def make_search(
     max_depth: int,
     min_children: int,
     max_children: int,
+    no_geo: bool = False,
 ) -> List[str]:
-    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children, no_geo=no_geo)
     offset = rnd.choice([0, 10, 100, 300, 500, 1000])
     limit = rnd.choice([10, 50, 100, 200])
     cmd = ["FT.SEARCH", INDEX_NAME, q]
+    tag_fields = effective_tag_fields(schema, no_geo)
     if rnd.random() < 0.5:
         cmd += ["NOCONTENT"]
     else:
         ret = rnd.sample(
-            schema.text_fields + list(schema.tag_fields),
-            k=min(10, len(schema.text_fields) + len(schema.tag_fields)),
+            schema.text_fields + tag_fields,
+            k=min(10, len(schema.text_fields) + len(tag_fields)),
         )
         cmd += ["RETURN", str(len(ret))] + ret
     if rnd.random() < 0.55:
@@ -286,7 +290,7 @@ def make_search(
         keys = rnd.sample(vocab.sampled_key_list, k=min(rnd.randint(1, 4), len(vocab.sampled_key_list)))
         cmd += ["INKEYS", str(len(keys))] + keys
     if rnd.random() < 0.35:
-        sort_field = rnd.choice(list(schema.tag_fields))
+        sort_field = rnd.choice(tag_fields)
         direction = rnd.choice(["ASC", "DESC"])
         cmd += ["SORTBY", sort_field, direction]
     if rnd.random() < 0.2:
@@ -308,8 +312,9 @@ def make_aggregate(
     max_depth: int,
     min_children: int,
     max_children: int,
+    no_geo: bool = False,
 ) -> List[str]:
-    tag_fields = list(schema.tag_fields)
+    tag_fields = effective_tag_fields(schema, no_geo)
     if len(tag_fields) >= 3:
         group_field, group_field_2, group_field_3 = rnd.sample(tag_fields, k=3)
     elif len(tag_fields) >= 2:
@@ -319,8 +324,8 @@ def make_aggregate(
         group_field = group_field_2 = group_field_3 = tag_fields[0]
     distinct_candidates = [f for f in tag_fields if f not in {group_field, group_field_2, group_field_3}]
     distinct_field = rnd.choice(distinct_candidates) if distinct_candidates else rnd.choice(tag_fields)
-    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
-    scalar_tag_fields = [f for f, sep in schema.tag_fields.items() if sep == ","]
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children, no_geo=no_geo)
+    scalar_tag_fields = [f for f in tag_fields if schema.tag_fields.get(f) == ","]
     apply_src = rnd.choice(scalar_tag_fields) if scalar_tag_fields else group_field
     required_fields = {group_field, group_field_2, group_field_3, distinct_field, apply_src}
     candidate_fields = schema.text_fields + tag_fields
@@ -383,8 +388,9 @@ def make_profile(
     max_depth: int,
     min_children: int,
     max_children: int,
+    no_geo: bool = False,
 ) -> List[str]:
-    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
+    q = build_complex_query(schema, vocab, rnd, min_depth, max_depth, min_children, max_children, no_geo=no_geo)
     return [
         "FT.PROFILE",
         INDEX_NAME,
@@ -481,6 +487,7 @@ def worker(
     min_children: int,
     max_children: int,
     op_weights: Tuple[int, int, int],
+    no_geo: bool = False,
 ) -> None:
     rnd = random.Random(seed)
     r = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=socket_timeout, socket_connect_timeout=8)
@@ -490,7 +497,7 @@ def worker(
             weights=list(op_weights),
             k=1,
         )[0]
-        cmd = maker(schema, vocab, rnd, min_depth, max_depth, min_children, max_children)
+        cmd = maker(schema, vocab, rnd, min_depth, max_depth, min_children, max_children, no_geo)
         op = op_name(cmd)
         t0 = time.monotonic()
         ok, err = True, None
