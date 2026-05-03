@@ -5,7 +5,8 @@ complexQueryStressTester.py
 
 Multi-threaded stress / fuzz tester for the `idx:books` RediSearch index that
 is created by `bookHashPopulatorHFE.py`.
-https://cursor.com/agents/bc-dc474151-f5c0-48d2-a72b-839705ee5466
+cursor cloud agent - https://cursor.com/agents/bc-dc474151-f5c0-48d2-a72b-839705ee5466
+Jira ticket - https://redislabs.atlassian.net/browse/MOD-15364
 
 Why a separate tool?
 --------------------
