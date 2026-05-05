@@ -1,11 +1,13 @@
 import argparse
 import random
 import re
+import signal
 import threading
 import time
 
 import redis
 from faker import Faker
+from redis.cluster import RedisCluster
 from redis.commands.search.field import TagField, TextField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
@@ -14,6 +16,35 @@ from redis.commands.search.query import Query
 REDIS_KEY_BASE = "alon:shmuely:redis:data:store:application"
 INDEX_NAME = "idx:books"
 SLOT_BUCKETS = 64
+
+# Compiled once at import time; `extract_bucket_tag_from_key` is on the rename
+# hot path, so paying the regex compile cost per call is wasteful.
+BUCKET_TAG_PATTERN = re.compile(
+    rf"^{re.escape(REDIS_KEY_BASE)}:\{{(b\d{{2}})\}}:\d+$"
+)
+KEY_PREFIX = f"{REDIS_KEY_BASE}:"
+
+# Hoisted out of `generate_random_book` so the literal sequences are not
+# rebuilt on every book.
+EDITIONS_POOL = (
+    "english", "spanish", "french", "german", "italian", "chinese",
+    "japanese", "russian", "arabic", "portuguese", "korean", "dutch",
+    "swedish", "norwegian", "danish", "finnish", "polish", "turkish",
+    "hindi", "urdu", "greek", "hebrew", "thai", "vietnamese",
+    "indonesian", "hungarian", "czech", "slovak", "romanian",
+    "bulgarian", "ukrainian", "serbian", "croatian", "slovenian", "latvian",
+)
+GENRES_POOL = (
+    "comics (superheroes)", "fiction", "non-fiction", "science fiction",
+    "fantasy", "mystery", "romance", "history", "horror", "biography",
+    "thriller", "self-help", "poetry", "cookbooks", "memoir",
+    "young adult", "children's literature", "drama", "travel", "science",
+    "art", "philosophy", "psychology", "religion", "true crime",
+    "graphic novel", "adventure", "political", "health", "humor",
+)
+INVENTORY_STATUSES = ("available", "maintenance", "on_loan", "for_sale")
+FORMAT_OPTIONS = ("hardcover", "paperback", "ebook")
+AVAILABILITY_OPTIONS = (True, False)
 
 fake = Faker()
 
@@ -40,19 +71,27 @@ def get_counters_snapshot():
         return dict(COUNTERS)
 
 
+def get_counter_values(*names):
+    """Return only the requested counter values under a single lock acquisition.
+
+    Cheaper than `get_counters_snapshot()` for hot loops that need 2-3 fields,
+    because it avoids copying the whole dict.
+    """
+    with COUNTERS_LOCK:
+        return tuple(COUNTERS[name] for name in names)
+
+
 def make_key(book_id):
     bucket_tag = f"b{book_id % SLOT_BUCKETS:02d}"
     return f"{REDIS_KEY_BASE}:{{{bucket_tag}}}:{book_id}"
 
 
 def is_book_key(key_name):
-    return str(key_name).startswith(f"{REDIS_KEY_BASE}:")
+    return str(key_name).startswith(KEY_PREFIX)
 
 
 def extract_bucket_tag_from_key(key_name):
-    key = str(key_name)
-    pattern = rf"^{re.escape(REDIS_KEY_BASE)}:\{{(b\d{{2}})\}}:\d+$"
-    match = re.match(pattern, key)
+    match = BUCKET_TAG_PATTERN.match(str(key_name))
     if match is None:
         return None
     return match.group(1)
@@ -82,38 +121,94 @@ def write_book_hash(r, key, mapping, expiration_range):
     r.hsetex(key, mapping=mapping, ex=ttl_seconds)
 
 
-def create_redis_connection_target(redis_url, max_connections, use_oss_cluster_api=False):
+def create_redis_client(redis_url, max_connections, use_oss_cluster_api=False):
+    """Build a single Redis client (standalone or cluster).
+
+    Both `redis.Redis` (backed by a `ConnectionPool`) and `RedisCluster` are
+    thread-safe, so the returned client is intended to be shared across all
+    worker threads instead of being rebuilt per thread/iteration.
+    """
     if use_oss_cluster_api:
         try:
-            return redis.RedisCluster.from_url(
+            return RedisCluster.from_url(
                 redis_url,
                 decode_responses=True,
-                max_connections=max_connections
+                max_connections=max_connections,
             )
         except TypeError:
             # Compatibility fallback for redis-py variants that don't expose max_connections here.
-            return redis.RedisCluster.from_url(
+            return RedisCluster.from_url(
                 redis_url,
-                decode_responses=True
+                decode_responses=True,
             )
 
-    return redis.ConnectionPool.from_url(
+    pool = redis.ConnectionPool.from_url(
         redis_url,
         max_connections=max_connections,
-        decode_responses=True
+        decode_responses=True,
     )
+    return redis.Redis(connection_pool=pool)
 
 
-def get_redis_client(connection_target, use_oss_cluster_api=False):
-    if use_oss_cluster_api:
-        return connection_target
-    return redis.Redis(connection_pool=connection_target)
-
-
-def index_exists(connection_target, index_name, use_oss_cluster_api=False):
+def close_redis_client(client):
+    """Best-effort shutdown of a Redis client and its underlying connection pool(s)."""
+    if client is None:
+        return
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
-        r.ft(index_name).info()
+        client.close()
+    except Exception as exc:
+        print(f"Error closing Redis client: {exc}")
+    try:
+        if isinstance(client, RedisCluster):
+            disconnect = getattr(client, "disconnect_connection_pools", None)
+            if disconnect is not None:
+                disconnect()
+        else:
+            pool = getattr(client, "connection_pool", None)
+            if pool is not None:
+                pool.disconnect()
+    except Exception as exc:
+        print(f"Error disconnecting Redis pool(s): {exc}")
+
+
+class PrimaryNodeRotator:
+    """Round-robin RANDOMKEY targeting across cluster primary nodes.
+
+    `RedisCluster.randomkey()` only hits a single node per call, so without
+    direction it biases toward whichever node redis-py happens to pick. This
+    rotator cycles through `get_primaries()` so every primary is sampled
+    fairly across consecutive calls. Falls back to `RedisCluster.RANDOM`
+    when the topology can't be enumerated.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self._lock = threading.Lock()
+        self._idx = 0
+
+    def next_target(self):
+        try:
+            primaries = list(self._client.get_primaries())
+        except Exception:
+            primaries = []
+        if not primaries:
+            return RedisCluster.RANDOM
+        with self._lock:
+            node = primaries[self._idx % len(primaries)]
+            self._idx += 1
+        return node
+
+
+def random_book_key(client, rotator):
+    """RANDOMKEY wrapper that rotates targets across primaries in cluster mode."""
+    if rotator is None:
+        return client.randomkey()
+    return client.randomkey(target_nodes=rotator.next_target())
+
+
+def index_exists(client, index_name):
+    try:
+        client.ft(index_name).info()
         print(f"Search index '{index_name}' already exists.")
         return True
     except redis.exceptions.ResponseError:
@@ -124,16 +219,14 @@ def index_exists(connection_target, index_name, use_oss_cluster_api=False):
         return False
 
 
-def create_search_index(connection_target, use_oss_cluster_api=False):
+def create_search_index(client):
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
-
-        if index_exists(connection_target, INDEX_NAME, use_oss_cluster_api):
+        if index_exists(client, INDEX_NAME):
             print("Search index already exists.")
             return
 
         print("Creating search index (Flex/disk index compatible: no SORTABLE, no NUMERIC, no GEO fields; SKIPINITIALSCAN enabled).")
-        r.ft(INDEX_NAME).create_index(
+        client.ft(INDEX_NAME).create_index(
             [
                 TextField("author"),
                 TagField("id"),
@@ -188,31 +281,11 @@ def generate_random_book(book_id):
         "author": fake.name(),
         "id": str(book_id),
         "description": fake.paragraph(random.randint(25, 80)),
-        "editions": random.sample(
-            [
-                "english", "spanish", "french", "german", "italian", "chinese",
-                "japanese", "russian", "arabic", "portuguese", "korean", "dutch",
-                "swedish", "norwegian", "danish", "finnish", "polish", "turkish",
-                "hindi", "urdu", "greek", "hebrew", "thai", "vietnamese",
-                "indonesian", "hungarian", "czech", "slovak", "romanian",
-                "bulgarian", "ukrainian", "serbian", "croatian", "slovenian", "latvian"
-            ],
-            k=random.randint(1, 5)
-        ),
-        "genres": random.sample(
-            [
-                "comics (superheroes)", "fiction", "non-fiction", "science fiction",
-                "fantasy", "mystery", "romance", "history", "horror", "biography",
-                "thriller", "self-help", "poetry", "cookbooks", "memoir",
-                "young adult", "children's literature", "drama", "travel", "science",
-                "art", "philosophy", "psychology", "religion", "true crime",
-                "graphic novel", "adventure", "political", "health", "humor"
-            ],
-            k=random.randint(1, 6)
-        ),
+        "editions": random.sample(EDITIONS_POOL, k=random.randint(1, 5)),
+        "genres": random.sample(GENRES_POOL, k=random.randint(1, 6)),
         "inventory": [
             {
-                "status": random.choice(["available", "maintenance", "on_loan", "for_sale"]),
+                "status": random.choice(INVENTORY_STATUSES),
                 "stock_id": f"{book_id}_{num}"
             }
             for num in range(random.randint(1, 10))
@@ -225,8 +298,8 @@ def generate_random_book(book_id):
         "title": " ".join(fake.words(nb=random.randint(1, 5))),
         "url": fake.url(),
         "year_published": random.randint(1900, 2023),
-        "format": random.choice(["hardcover", "paperback", "ebook"]),
-        "is_available": random.choice([True, False]),
+        "format": random.choice(FORMAT_OPTIONS),
+        "is_available": random.choice(AVAILABILITY_OPTIONS),
         "price": round(random.uniform(5, 100), 2),
         "isbn": fake.isbn13(),
         "address": fake.address().replace("\n", ", "),
@@ -319,80 +392,136 @@ def print_live_status(stop_event):
         time.sleep(1)
 
 
-def write_data_verification(connection_target, use_oss_cluster_api=False):
+def write_data_verification(client):
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
         book_data = generate_random_book(0)
         book_data["author"] = "Alon Shmuely"
         book_data["title"] = "QA architect"
         book_data["address"] = "98765 Ein Dor Apt. 0001 Rishon Lezion, IL 1948"
-        r.hset(make_key(0), mapping=flatten_book_for_hash(book_data))
+        client.hset(make_key(0), mapping=flatten_book_for_hash(book_data))
     except redis.exceptions.ConnectionError as e:
         print(f"Failed to write data verification. Error: {str(e)}")
 
 
-def read_data_verification(connection_target, stop_event, verify_sleep=0.05, use_oss_cluster_api=False):
-    try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
-        expected_key = make_key(0)
-        query = Query("Shmuely").no_content().paging(0, 1)
+def read_data_verification(client, stop_event, verify_sleep=0.05):
+    expected_key = make_key(0)
+    # TIMEOUT (ms) caps server-side execution so a slow shard can't stall the
+    # verifier; DIALECT 2 pins parser semantics so failure modes don't drift
+    # across server versions.
+    query = Query("Shmuely").no_content().paging(0, 1).timeout(50).dialect(2)
 
-        while not stop_event.is_set():
-            try:
-                docs = r.ft(INDEX_NAME).search(query).docs
-                if docs and getattr(docs[0], "id", None) == expected_key:
-                    increment_counter("data_verification_successful")
-                else:
-                    increment_counter("data_verification_error")
-            except (IndexError, redis.exceptions.ResponseError, redis.exceptions.ConnectionError) as e:
-                print(f"\nData verification failed. Error: {str(e)}")
+    while not stop_event.is_set():
+        try:
+            docs = client.ft(INDEX_NAME).search(query).docs
+            if docs and getattr(docs[0], "id", None) == expected_key:
+                increment_counter("data_verification_successful")
+            else:
                 increment_counter("data_verification_error")
+        except (IndexError, redis.exceptions.ResponseError, redis.exceptions.ConnectionError) as e:
+            print(f"\nData verification failed. Error: {str(e)}")
+            increment_counter("data_verification_error")
 
-            time.sleep(verify_sleep)
-
-    except redis.exceptions.ConnectionError as e:
-        print(f"\nFailed to start data verification. Error: {str(e)}")
+        if stop_event.wait(verify_sleep):
+            break
 
 
-def generating_books(connection_target, max_books, max_random, expiration_range=None, use_oss_cluster_api=False):
+def _build_pipeline(client):
+    """Construct a non-transactional pipeline, tolerating older redis-py variants
+    whose `RedisCluster.pipeline()` doesn't accept `transaction=`."""
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
-        for _ in range(1, max_books + 1):
-            book_id = random.randint(1, max_random)
-            book_data = generate_random_book(book_id)
-            flat = flatten_book_for_hash(book_data)
-            key = make_key(book_id)
-            write_book_hash(r, key, flat, expiration_range)
-            increment_counter("successful_write")
+        return client.pipeline(transaction=False)
+    except TypeError:
+        return client.pipeline()
+
+
+def _flush_write_batch(client, batch, expiration_range):
+    """Queue every (key, flat_mapping) pair into a pipeline and execute it.
+
+    Returns (success_count, failure_count). Uses `raise_on_error=False` so a
+    single bad command doesn't poison the rest of the batch; per-command
+    failures are counted via the returned exception sentinels.
+    """
+    if not batch:
+        return 0, 0
+
+    pipe = _build_pipeline(client)
+    if expiration_range is None:
+        for key, flat in batch:
+            pipe.hset(key, mapping=flat)
+    else:
+        x, y = expiration_range
+        for key, flat in batch:
+            pipe.hsetex(key, mapping=flat, ex=random.randint(x, y))
+
+    try:
+        results = pipe.execute(raise_on_error=False)
+    except redis.exceptions.ConnectionError as exc:
+        print(f"\nPipeline flush failed. Error: {exc}")
+        return 0, len(batch)
+
+    success = sum(1 for r in results if not isinstance(r, BaseException))
+    return success, len(batch) - success
+
+
+def generating_books(client, max_books, max_random, expiration_range, stop_event, pipeline_size=100):
+    """Generate up to `max_books` book hashes, batching writes via pipeline.
+
+    `pipeline_size` controls how many HSET/HSETEX commands are queued per
+    flush. Larger batches drop RTT overhead dramatically; in cluster mode,
+    redis-py routes the queued commands per-shard in parallel.
+    """
+    pipeline_size = max(1, int(pipeline_size))
+    remaining = max_books
+    batch = []
+
+    try:
+        while remaining > 0 and not stop_event.is_set():
+            batch_n = min(pipeline_size, remaining)
+            batch.clear()
+            for _ in range(batch_n):
+                book_id = random.randint(1, max_random)
+                key = make_key(book_id)
+                flat = flatten_book_for_hash(generate_random_book(book_id))
+                batch.append((key, flat))
+
+            success, failure = _flush_write_batch(client, batch, expiration_range)
+            if success:
+                increment_counter("successful_write", amount=success)
+            if failure:
+                increment_counter("unsuccessful_write", amount=failure)
+            remaining -= batch_n
     except redis.exceptions.ConnectionError as e:
-        print(f"Failed to generate books. Error: {str(e)}")
-        increment_counter("unsuccessful_write")
+        print(f"\nFailed to generate books. Error: {str(e)}")
+        increment_counter("unsuccessful_write", amount=remaining if remaining > 0 else 1)
 
 
-def deleting_books(connection_target, writer_done_event, del_ratio, poll_sleep=0.01, use_oss_cluster_api=False):
+def deleting_books(client, writer_done_event, stop_event, del_ratio, rotator, poll_sleep=0.01):
     if del_ratio <= 0:
         return
 
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
         verification_key = make_key(0)
 
-        while True:
-            counters = get_counters_snapshot()
-            target_deletes = int(counters["successful_write"] * del_ratio)
-            sent_deletes = counters["successful_delete"] + counters["unsuccessful_delete"]
+        while not stop_event.is_set():
+            sw, sd, ud = get_counter_values(
+                "successful_write", "successful_delete", "unsuccessful_delete"
+            )
+            target_deletes = int(sw * del_ratio)
+            sent_deletes = sd + ud
 
             if writer_done_event.is_set() and sent_deletes >= target_deletes:
                 break
 
             if sent_deletes >= target_deletes:
-                time.sleep(poll_sleep)
+                if stop_event.wait(poll_sleep):
+                    break
                 continue
 
-            random_key = r.randomkey()
+            random_key = random_book_key(client, rotator)
 
             if random_key is None:
-                time.sleep(poll_sleep)
+                if stop_event.wait(poll_sleep):
+                    break
                 continue
 
             if random_key == verification_key:
@@ -401,7 +530,7 @@ def deleting_books(connection_target, writer_done_event, del_ratio, poll_sleep=0
             if not is_book_key(random_key):
                 continue
 
-            deleted = r.delete(random_key)
+            deleted = client.delete(random_key)
 
             if deleted == 1:
                 increment_counter("successful_delete")
@@ -413,30 +542,33 @@ def deleting_books(connection_target, writer_done_event, del_ratio, poll_sleep=0
         increment_counter("unsuccessful_delete")
 
 
-def renaming_books(connection_target, writer_done_event, rename_ratio, max_random, poll_sleep=0.01, use_oss_cluster_api=False):
+def renaming_books(client, writer_done_event, stop_event, rename_ratio, max_random, rotator, poll_sleep=0.01):
     if rename_ratio <= 0:
         return
 
     try:
-        r = get_redis_client(connection_target, use_oss_cluster_api)
         verification_key = make_key(0)
 
-        while True:
-            counters = get_counters_snapshot()
-            target_renames = int(counters["successful_write"] * rename_ratio)
-            sent_renames = counters["successful_rename"] + counters["unsuccessful_rename"]
+        while not stop_event.is_set():
+            sw, sr, ur = get_counter_values(
+                "successful_write", "successful_rename", "unsuccessful_rename"
+            )
+            target_renames = int(sw * rename_ratio)
+            sent_renames = sr + ur
 
             if writer_done_event.is_set() and sent_renames >= target_renames:
                 break
 
             if sent_renames >= target_renames:
-                time.sleep(poll_sleep)
+                if stop_event.wait(poll_sleep):
+                    break
                 continue
 
-            random_key = r.randomkey()
+            random_key = random_book_key(client, rotator)
 
             if random_key is None:
-                time.sleep(poll_sleep)
+                if stop_event.wait(poll_sleep):
+                    break
                 continue
 
             if random_key == verification_key:
@@ -456,7 +588,7 @@ def renaming_books(connection_target, writer_done_event, rename_ratio, max_rando
                 continue
 
             try:
-                r.rename(random_key, renamed_key)
+                client.rename(random_key, renamed_key)
                 increment_counter("successful_rename")
             except redis.exceptions.RedisError:
                 increment_counter("unsuccessful_rename")
@@ -464,6 +596,21 @@ def renaming_books(connection_target, writer_done_event, rename_ratio, max_rando
     except redis.exceptions.ConnectionError as e:
         print(f"\nFailed while renaming books. Error: {str(e)}")
         increment_counter("unsuccessful_rename")
+
+
+def install_signal_handlers(*events):
+    """Install SIGINT/SIGTERM handlers that set every provided Event for graceful shutdown."""
+    def _handler(signum, _frame):
+        print(f"\nReceived signal {signum}; initiating graceful shutdown...")
+        for event in events:
+            event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Not running in the main thread, or platform doesn't support this signal.
+            pass
 
 
 if __name__ == "__main__":
@@ -505,30 +652,43 @@ if __name__ == "__main__":
         help="Rename-to-write ratio. For each written book, approximately this ratio of RENAME commands "
              "is sent from a dedicated rename thread using RANDOMKEY. Default: 0.01 (enabled).",
     )
+    arg_parser.add_argument(
+        "--pipeline-size",
+        default=100,
+        type=int,
+        dest="pipeline_size",
+        help="Number of HSET/HSETEX commands batched per pipeline flush in the writer thread. "
+             "Use 1 to disable pipelining. Default: 100.",
+    )
     args = arg_parser.parse_args()
 
+    redis_client = None
     try:
         if args.del_ratio < 0:
             raise ValueError(f"--del-ratio must be >= 0, got: {args.del_ratio}")
         if args.rename_ratio < 0:
             raise ValueError(f"--rename-ratio must be >= 0, got: {args.rename_ratio}")
+        if args.pipeline_size < 1:
+            raise ValueError(f"--pipeline-size must be >= 1, got: {args.pipeline_size}")
 
         api_mode = "oss-cluster-api" if args.use_oss_cluster_api else "standalone-api"
         print(
             f"Connecting to Redis at {args.redis_url} with a max of {args.max_connections} connections "
             f"(mode: {api_mode})"
         )
-        redis_connection_target = create_redis_connection_target(
+        redis_client = create_redis_client(
             args.redis_url, args.max_connections, args.use_oss_cluster_api
+        )
+        cluster_rotator = (
+            PrimaryNodeRotator(redis_client) if args.use_oss_cluster_api else None
         )
 
         if args.flush:
             print("Flushing Redis database...")
-            r = get_redis_client(redis_connection_target, args.use_oss_cluster_api)
-            r.flushall()
+            redis_client.flushall()
 
-        create_search_index(redis_connection_target, args.use_oss_cluster_api)
-        write_data_verification(redis_connection_target, args.use_oss_cluster_api)
+        create_search_index(redis_client)
+        write_data_verification(redis_client)
 
         if args.expiration_range is not None:
             x, y = args.expiration_range
@@ -538,6 +698,11 @@ if __name__ == "__main__":
             )
         else:
             print("Hash key expiration disabled (no TTL on book hashes).")
+
+        if args.pipeline_size > 1:
+            print(f"Writer pipelining enabled: batch size = {args.pipeline_size} commands per flush.")
+        else:
+            print("Writer pipelining disabled (--pipeline-size=1).")
 
         del_enabled = args.del_ratio > 0
         if del_enabled:
@@ -561,29 +726,38 @@ if __name__ == "__main__":
         status_stop_event = threading.Event()
         writer_done_event = threading.Event()
 
+        # SIGINT/SIGTERM trip every shutdown gate so the orderly join sequence below
+        # unblocks promptly instead of leaving threads spinning.
+        install_signal_handlers(stop_event, writer_done_event, status_stop_event)
+
         verification_thread = threading.Thread(
             target=read_data_verification,
-            args=(redis_connection_target, stop_event, args.verify_sleep, args.use_oss_cluster_api)
+            args=(redis_client, stop_event, args.verify_sleep),
+            daemon=True,
         )
         write_thread = threading.Thread(
             target=generating_books,
-            args=(redis_connection_target, args.max_books, args.max_random, args.expiration_range, args.use_oss_cluster_api)
+            args=(redis_client, args.max_books, args.max_random, args.expiration_range, stop_event, args.pipeline_size),
+            daemon=True,
         )
         delete_thread = None
         if del_enabled:
             delete_thread = threading.Thread(
                 target=deleting_books,
-                args=(redis_connection_target, writer_done_event, args.del_ratio, 0.01, args.use_oss_cluster_api)
+                args=(redis_client, writer_done_event, stop_event, args.del_ratio, cluster_rotator, 0.01),
+                daemon=True,
             )
         rename_thread = None
         if rename_enabled:
             rename_thread = threading.Thread(
                 target=renaming_books,
-                args=(redis_connection_target, writer_done_event, args.rename_ratio, args.max_random, 0.01, args.use_oss_cluster_api)
+                args=(redis_client, writer_done_event, stop_event, args.rename_ratio, args.max_random, cluster_rotator, 0.01),
+                daemon=True,
             )
         status_thread = threading.Thread(
             target=print_live_status,
-            args=(status_stop_event,)
+            args=(status_stop_event,),
+            daemon=True,
         )
 
         status_thread.start()
@@ -624,3 +798,5 @@ if __name__ == "__main__":
         print(f"Failed to connect to Redis. Error: {str(e)}")
     except ValueError as e:
         print(f"Invalid input. Error: {str(e)}")
+    finally:
+        close_redis_client(redis_client)
