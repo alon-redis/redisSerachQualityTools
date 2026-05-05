@@ -1,5 +1,6 @@
 import argparse
 import random
+import re
 import threading
 import time
 
@@ -12,6 +13,7 @@ from redis.commands.search.query import Query
 
 REDIS_KEY_BASE = "alon:shmuely:redis:data:store:application"
 INDEX_NAME = "idx:books"
+SLOT_BUCKETS = 64
 
 fake = Faker()
 
@@ -39,11 +41,21 @@ def get_counters_snapshot():
 
 
 def make_key(book_id):
-    return f"{REDIS_KEY_BASE}:{book_id}"
+    bucket_tag = f"b{book_id % SLOT_BUCKETS:02d}"
+    return f"{REDIS_KEY_BASE}:{{{bucket_tag}}}:{book_id}"
 
 
 def is_book_key(key_name):
     return str(key_name).startswith(f"{REDIS_KEY_BASE}:")
+
+
+def extract_bucket_tag_from_key(key_name):
+    key = str(key_name)
+    pattern = rf"^{re.escape(REDIS_KEY_BASE)}:\{{(b\d{{2}})\}}:\d+$"
+    match = re.match(pattern, key)
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def parse_expiration_range(value):
@@ -70,7 +82,21 @@ def write_book_hash(r, key, mapping, expiration_range):
     r.hsetex(key, mapping=mapping, ex=ttl_seconds)
 
 
-def create_redis_connection_pool(redis_url, max_connections):
+def create_redis_connection_target(redis_url, max_connections, use_oss_cluster_api=False):
+    if use_oss_cluster_api:
+        try:
+            return redis.RedisCluster.from_url(
+                redis_url,
+                decode_responses=True,
+                max_connections=max_connections
+            )
+        except TypeError:
+            # Compatibility fallback for redis-py variants that don't expose max_connections here.
+            return redis.RedisCluster.from_url(
+                redis_url,
+                decode_responses=True
+            )
+
     return redis.ConnectionPool.from_url(
         redis_url,
         max_connections=max_connections,
@@ -78,9 +104,15 @@ def create_redis_connection_pool(redis_url, max_connections):
     )
 
 
-def index_exists(connection_pool, index_name):
+def get_redis_client(connection_target, use_oss_cluster_api=False):
+    if use_oss_cluster_api:
+        return connection_target
+    return redis.Redis(connection_pool=connection_target)
+
+
+def index_exists(connection_target, index_name, use_oss_cluster_api=False):
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         r.ft(index_name).info()
         print(f"Search index '{index_name}' already exists.")
         return True
@@ -92,11 +124,11 @@ def index_exists(connection_pool, index_name):
         return False
 
 
-def create_search_index(connection_pool):
+def create_search_index(connection_target, use_oss_cluster_api=False):
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
 
-        if index_exists(connection_pool, INDEX_NAME):
+        if index_exists(connection_target, INDEX_NAME, use_oss_cluster_api):
             print("Search index already exists.")
             return
 
@@ -287,9 +319,9 @@ def print_live_status(stop_event):
         time.sleep(1)
 
 
-def write_data_verification(connection_pool):
+def write_data_verification(connection_target, use_oss_cluster_api=False):
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         book_data = generate_random_book(0)
         book_data["author"] = "Alon Shmuely"
         book_data["title"] = "QA architect"
@@ -299,9 +331,9 @@ def write_data_verification(connection_pool):
         print(f"Failed to write data verification. Error: {str(e)}")
 
 
-def read_data_verification(connection_pool, stop_event, verify_sleep=0.05):
+def read_data_verification(connection_target, stop_event, verify_sleep=0.05, use_oss_cluster_api=False):
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         expected_key = make_key(0)
         query = Query("Shmuely").no_content().paging(0, 1)
 
@@ -322,9 +354,9 @@ def read_data_verification(connection_pool, stop_event, verify_sleep=0.05):
         print(f"\nFailed to start data verification. Error: {str(e)}")
 
 
-def generating_books(connection_pool, max_books, max_random, expiration_range=None):
+def generating_books(connection_target, max_books, max_random, expiration_range=None, use_oss_cluster_api=False):
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         for _ in range(1, max_books + 1):
             book_id = random.randint(1, max_random)
             book_data = generate_random_book(book_id)
@@ -337,12 +369,12 @@ def generating_books(connection_pool, max_books, max_random, expiration_range=No
         increment_counter("unsuccessful_write")
 
 
-def deleting_books(connection_pool, writer_done_event, del_ratio, poll_sleep=0.01):
+def deleting_books(connection_target, writer_done_event, del_ratio, poll_sleep=0.01, use_oss_cluster_api=False):
     if del_ratio <= 0:
         return
 
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         verification_key = make_key(0)
 
         while True:
@@ -381,12 +413,12 @@ def deleting_books(connection_pool, writer_done_event, del_ratio, poll_sleep=0.0
         increment_counter("unsuccessful_delete")
 
 
-def renaming_books(connection_pool, writer_done_event, rename_ratio, max_random, poll_sleep=0.01):
+def renaming_books(connection_target, writer_done_event, rename_ratio, max_random, poll_sleep=0.01, use_oss_cluster_api=False):
     if rename_ratio <= 0:
         return
 
     try:
-        r = redis.Redis(connection_pool=connection_pool)
+        r = get_redis_client(connection_target, use_oss_cluster_api)
         verification_key = make_key(0)
 
         while True:
@@ -413,8 +445,12 @@ def renaming_books(connection_pool, writer_done_event, rename_ratio, max_random,
             if not is_book_key(random_key):
                 continue
 
+            source_bucket_tag = extract_bucket_tag_from_key(random_key)
+            if source_bucket_tag is None:
+                continue
+
             new_book_id = random.randint(1, max_random)
-            renamed_key = make_key(new_book_id)
+            renamed_key = f"{REDIS_KEY_BASE}:{{{source_bucket_tag}}}:{new_book_id}"
 
             if renamed_key == verification_key or renamed_key == random_key:
                 continue
@@ -431,12 +467,18 @@ def renaming_books(connection_pool, writer_done_event, rename_ratio, max_random,
 
 
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser(description="Running the book store application v2.3 (Flex/disk index compatible: no SORTABLE, no NUMERIC, no GEO fields)")
+    arg_parser = argparse.ArgumentParser(description="Running the book store application v2.4 (Flex/disk index compatible: no SORTABLE, no NUMERIC, no GEO fields)")
     arg_parser.add_argument("--redis", default="redis://localhost:6379", dest="redis_url", help="Redis URL to connect to.")
     arg_parser.add_argument("--max-connections", default=10, type=int, dest="max_connections", help="Maximum number of Redis connections.")
     arg_parser.add_argument("--max-books", default=3000, type=int, dest="max_books", help="Maximum number of books")
     arg_parser.add_argument("--max-random", default=3000, type=int, dest="max_random", help="Maximum random number of books")
     arg_parser.add_argument("--flush", action="store_true", help="Flush the Redis database on startup")
+    arg_parser.add_argument(
+        "--oss-cluster-api",
+        action="store_true",
+        dest="use_oss_cluster_api",
+        help="Use Redis OSS Cluster API mode (RedisCluster client). Default: disabled (standalone Redis API).",
+    )
     arg_parser.add_argument("--verify-sleep", default=0.05, type=float, dest="verify_sleep", help="Sleep time in seconds between verification queries")
     arg_parser.add_argument(
         "--expiration-time",
@@ -471,16 +513,22 @@ if __name__ == "__main__":
         if args.rename_ratio < 0:
             raise ValueError(f"--rename-ratio must be >= 0, got: {args.rename_ratio}")
 
-        print(f"Connecting to Redis at {args.redis_url} with a max of {args.max_connections} connections")
-        redis_pool = create_redis_connection_pool(args.redis_url, args.max_connections)
+        api_mode = "oss-cluster-api" if args.use_oss_cluster_api else "standalone-api"
+        print(
+            f"Connecting to Redis at {args.redis_url} with a max of {args.max_connections} connections "
+            f"(mode: {api_mode})"
+        )
+        redis_connection_target = create_redis_connection_target(
+            args.redis_url, args.max_connections, args.use_oss_cluster_api
+        )
 
         if args.flush:
             print("Flushing Redis database...")
-            r = redis.Redis(connection_pool=redis_pool)
+            r = get_redis_client(redis_connection_target, args.use_oss_cluster_api)
             r.flushall()
 
-        create_search_index(redis_pool)
-        write_data_verification(redis_pool)
+        create_search_index(redis_connection_target, args.use_oss_cluster_api)
+        write_data_verification(redis_connection_target, args.use_oss_cluster_api)
 
         if args.expiration_range is not None:
             x, y = args.expiration_range
@@ -515,23 +563,23 @@ if __name__ == "__main__":
 
         verification_thread = threading.Thread(
             target=read_data_verification,
-            args=(redis_pool, stop_event, args.verify_sleep)
+            args=(redis_connection_target, stop_event, args.verify_sleep, args.use_oss_cluster_api)
         )
         write_thread = threading.Thread(
             target=generating_books,
-            args=(redis_pool, args.max_books, args.max_random, args.expiration_range)
+            args=(redis_connection_target, args.max_books, args.max_random, args.expiration_range, args.use_oss_cluster_api)
         )
         delete_thread = None
         if del_enabled:
             delete_thread = threading.Thread(
                 target=deleting_books,
-                args=(redis_pool, writer_done_event, args.del_ratio)
+                args=(redis_connection_target, writer_done_event, args.del_ratio, 0.01, args.use_oss_cluster_api)
             )
         rename_thread = None
         if rename_enabled:
             rename_thread = threading.Thread(
                 target=renaming_books,
-                args=(redis_pool, writer_done_event, args.rename_ratio, args.max_random)
+                args=(redis_connection_target, writer_done_event, args.rename_ratio, args.max_random, 0.01, args.use_oss_cluster_api)
             )
         status_thread = threading.Thread(
             target=print_live_status,
