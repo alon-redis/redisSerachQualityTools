@@ -112,16 +112,11 @@ class _ErrorLog:
         self.lock = threading.Lock()
         self.dirty = False
 
-    def record(self, category, qstr, extras, limit, err):
+    def record(self, category, cmd_args, err):
         ts = datetime.now().isoformat(sep=" ", timespec="milliseconds")
         err_msg = (
             f"{type(err).__name__}: {err}" if isinstance(err, BaseException) else str(err)
         )
-        cmd_args = [
-            "FT.SEARCH", INDEX_NAME, qstr,
-            "NOCONTENT", "LIMIT", "0", str(limit),
-            *extras,
-        ]
         # redis-cli MONITOR-style line: each arg double-quoted, easy to paste.
         cmd_str = " ".join(f"\"{a}\"" for a in cmd_args)
         with self.lock:
@@ -154,9 +149,9 @@ class _ErrorLog:
 ERROR_LOG = None
 
 
-def maybe_record_error(category, qstr, extras, limit, err):
+def maybe_record_error(category, cmd_args, err):
     if ERROR_LOG is not None:
-        ERROR_LOG.record(category, qstr, extras, limit, err)
+        ERROR_LOG.record(category, cmd_args, err)
 
 
 def error_log_flusher(stop_event, interval=2.0):
@@ -281,11 +276,14 @@ TEXT_TOKEN_POOL = [
     "shmuely", "qa", "architect",
 ]
 
-ADVANCED_CATEGORY_NAMES = ["boolean", "text_ops", "in_list", "dialect2"]
+ADVANCED_SEARCH_CATEGORY_NAMES = ["boolean", "text_ops", "in_list", "dialect2"]
+ADVANCED_META_CATEGORY_NAMES = ["ft_info", "ft_explain", "ft_profile"]
+ADVANCED_CATEGORY_NAMES = ADVANCED_SEARCH_CATEGORY_NAMES + ADVANCED_META_CATEGORY_NAMES
 ADVANCED_MAX_CLAUSES = 5
 ADVANCED_MAX_IN_LIST = 50
 ADVANCED_NOT_PROBABILITY = 0.2
 ADVANCED_GROUP_PROBABILITY = 0.5
+ADVANCED_META_RATIO_DEFAULT = 0.1
 
 
 def _adv_single_tag_clause():
@@ -398,7 +396,7 @@ def _adv_dialect2_query():
 
 
 def build_advanced_query():
-    """Pick uniformly across the 4 advanced categories. Always sets DIALECT 2.
+    """Pick uniformly across the 4 search-query advanced categories.
 
     Returns (query_string, extra_args, category_name).
     """
@@ -416,6 +414,60 @@ def build_advanced_query():
     return qstr, extras, name
 
 
+def build_simple_command(limit):
+    """Return (command_args, category_name, response_kind)."""
+    qstr, extras, category = build_simple_query()
+    cmd_args = [
+        "FT.SEARCH", INDEX_NAME, qstr,
+        "NOCONTENT", "LIMIT", "0", str(limit),
+        *extras,
+    ]
+    return cmd_args, category, "search"
+
+
+def build_advanced_search_command(limit):
+    """Return one FT.SEARCH advanced command."""
+    qstr, extras, category = build_advanced_query()
+    cmd_args = [
+        "FT.SEARCH", INDEX_NAME, qstr,
+        "NOCONTENT", "LIMIT", "0", str(limit),
+        *extras,
+    ]
+    return cmd_args, category, "search"
+
+
+def build_advanced_meta_command(limit):
+    """Return one of FT.INFO / FT.EXPLAIN / FT.PROFILE (equal weight)."""
+    kind = random.choice(ADVANCED_META_CATEGORY_NAMES)
+    if kind == "ft_info":
+        return ["FT.INFO", INDEX_NAME], "ft_info", "meta"
+    if kind == "ft_explain":
+        # Keep EXPLAIN deterministic and PARAMS-free for broad compatibility.
+        explain_query = random.choice([
+            _adv_boolean_query(),
+            _adv_text_query(),
+            _adv_range_query(),
+        ])
+        cmd_args = ["FT.EXPLAIN", INDEX_NAME, explain_query, "DIALECT", "2"]
+        return cmd_args, "ft_explain", "meta"
+
+    # ft_profile
+    qstr, extras, _ = build_advanced_query()
+    cmd_args = [
+        "FT.PROFILE", INDEX_NAME, "SEARCH", "QUERY", qstr,
+        "NOCONTENT", "LIMIT", "0", str(limit),
+        *extras,
+    ]
+    return cmd_args, "ft_profile", "profile"
+
+
+def build_advanced_command(limit, advanced_meta_ratio):
+    """Mix advanced FT.SEARCH with advanced meta commands by ratio."""
+    if random.random() < advanced_meta_ratio:
+        return build_advanced_meta_command(limit)
+    return build_advanced_search_command(limit)
+
+
 # ---------------------------------------------------------------------------
 # Worker / status / stopper
 # ---------------------------------------------------------------------------
@@ -428,27 +480,37 @@ def parse_ft_search_response_nocontent(resp):
     return total, docs_returned
 
 
-def run_worker(connection_pool, build_query_fn, pipeline_depth, limit, stop_event):
+def parse_ft_profile_response_nocontent(resp):
+    """Extract FT.SEARCH-like docs count from FT.PROFILE response when present."""
+    if not isinstance(resp, list) or not resp:
+        return 0, 0
+    search_part = resp[0]
+    if not isinstance(search_part, list):
+        return 0, 0
+    return parse_ft_search_response_nocontent(search_part)
+
+
+def run_worker(connection_pool, build_command_fn, pipeline_depth, limit, stop_event):
     r = redis.Redis(connection_pool=connection_pool)
 
     while not stop_event.is_set():
-        # Each batch entry is (query_string, extras, category).
-        batch_queries = [build_query_fn() for _ in range(pipeline_depth)]
+        # Each batch entry is (command_args, category, response_kind).
+        batch_queries = [build_command_fn(limit) for _ in range(pipeline_depth)]
 
         if pipeline_depth == 1:
-            qstr, extras, category = batch_queries[0]
+            cmd_args, category, response_kind = batch_queries[0]
             try:
-                # Flex/disk index requires NOCONTENT (or RETURN 0); otherwise
-                # the server returns SEARCH_FLEX_SEARCH_NOCONTENT_OR_RETURN_0_REQUIRED.
-                resp = r.execute_command(
-                    "FT.SEARCH", INDEX_NAME, qstr,
-                    "NOCONTENT", "LIMIT", "0", str(limit),
-                    *extras,
-                )
-                _, docs_returned = parse_ft_search_response_nocontent(resp)
+                resp = r.execute_command(*cmd_args)
+                if response_kind == "search":
+                    _, docs_returned = parse_ft_search_response_nocontent(resp)
+                elif response_kind == "profile":
+                    _, docs_returned = parse_ft_profile_response_nocontent(resp)
+                else:
+                    docs_returned = 0
                 record_query_outcome(
                     category, success=True,
-                    docs_returned=docs_returned, zero=(docs_returned == 0),
+                    docs_returned=docs_returned,
+                    zero=(response_kind != "meta" and docs_returned == 0),
                 )
             except (
                 redis.exceptions.ResponseError,
@@ -456,36 +518,38 @@ def run_worker(connection_pool, build_query_fn, pipeline_depth, limit, stop_even
                 redis.exceptions.TimeoutError,
             ) as e:
                 record_query_outcome(category, success=False)
-                maybe_record_error(category, qstr, extras, limit, e)
+                maybe_record_error(category, cmd_args, e)
             continue
 
         try:
             pipe = r.pipeline(transaction=False)
-            for qstr, extras, _category in batch_queries:
-                pipe.execute_command(
-                    "FT.SEARCH", INDEX_NAME, qstr,
-                    "NOCONTENT", "LIMIT", "0", str(limit),
-                    *extras,
-                )
+            for cmd_args, _category, _response_kind in batch_queries:
+                pipe.execute_command(*cmd_args)
             results = pipe.execute(raise_on_error=False)
         except (
             redis.exceptions.ConnectionError,
             redis.exceptions.TimeoutError,
         ) as e:
-            for qstr, extras, category in batch_queries:
+            for cmd_args, category, _response_kind in batch_queries:
                 record_query_outcome(category, success=False)
-                maybe_record_error(category, qstr, extras, limit, e)
+                maybe_record_error(category, cmd_args, e)
             continue
 
-        for (qstr, extras, category), resp in zip(batch_queries, results):
+        for (cmd_args, category, response_kind), resp in zip(batch_queries, results):
             if isinstance(resp, Exception):
                 record_query_outcome(category, success=False)
-                maybe_record_error(category, qstr, extras, limit, resp)
+                maybe_record_error(category, cmd_args, resp)
                 continue
-            _, docs_returned = parse_ft_search_response_nocontent(resp)
+            if response_kind == "search":
+                _, docs_returned = parse_ft_search_response_nocontent(resp)
+            elif response_kind == "profile":
+                _, docs_returned = parse_ft_profile_response_nocontent(resp)
+            else:
+                docs_returned = 0
             record_query_outcome(
                 category, success=True,
-                docs_returned=docs_returned, zero=(docs_returned == 0),
+                docs_returned=docs_returned,
+                zero=(response_kind != "meta" and docs_returned == 0),
             )
 
 
@@ -637,6 +701,17 @@ if __name__ == "__main__":
                             help=("Workload type. 'simple' = single-clause queries; "
                                   "'advanced' = uniform mix of boolean / TEXT-ops / "
                                   "pseudo-range IN-list / DIALECT 2 patterns."))
+    arg_parser.add_argument(
+        "--advanced-meta-ratio",
+        default=ADVANCED_META_RATIO_DEFAULT,
+        type=float,
+        dest="advanced_meta_ratio",
+        help=(
+            "For --workload advanced: fraction [0..1] of commands dedicated to "
+            "FT.INFO/FT.EXPLAIN/FT.PROFILE (equal internal split). "
+            "Default: 0.1."
+        ),
+    )
     arg_parser.add_argument("--duration", default=0, type=int, dest="duration",
                             help="Run duration in seconds (0 = unlimited, stop with Ctrl+C).")
     arg_parser.add_argument("--max-queries", default=0, type=int, dest="max_queries",
@@ -674,11 +749,16 @@ if __name__ == "__main__":
             f"workers will contend for connections."
         )
 
+    if not 0.0 <= args.advanced_meta_ratio <= 1.0:
+        raise SystemExit("--advanced-meta-ratio must be between 0 and 1")
+
     if args.workload == "simple":
-        build_query_fn = build_simple_query
+        build_command_fn = build_simple_command
         category_names = SIMPLE_CATEGORY_NAMES
     else:
-        build_query_fn = build_advanced_query
+        build_command_fn = (
+            lambda limit: build_advanced_command(limit, args.advanced_meta_ratio)
+        )
         category_names = ADVANCED_CATEGORY_NAMES
 
     # Pre-register categories so the live line has a stable column ordering.
@@ -719,7 +799,7 @@ if __name__ == "__main__":
     workers = [
         threading.Thread(
             target=run_worker,
-            args=(pool, build_query_fn, args.pipeline_depth, args.limit, stop_event),
+            args=(pool, build_command_fn, args.pipeline_depth, args.limit, stop_event),
             daemon=True,
             name=f"qg-worker-{i}",
         )
