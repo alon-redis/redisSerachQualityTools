@@ -12,6 +12,10 @@ from redis.commands.search.field import TagField, TextField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
 
+# TODO LIST
+# 1. add HFE support to populator
+# 2. add json support
+
 
 REDIS_KEY_BASE = "alon:shmuely:redis:data:store:application"
 INDEX_NAME = "idx:books"
