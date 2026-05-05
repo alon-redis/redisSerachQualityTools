@@ -11,8 +11,8 @@ It:
 ## Usage
 
 ```bash
-chmod +x run_search_queries.sh
-./run_search_queries.sh cursorSearchQueryBatch.txt
+# chmod +x run_search_queries.sh
+# ./run_search_queries.sh cursorSearchQueryBatch.txt
 ```
 
 
