@@ -18,6 +18,18 @@ import (
 
 const preloadPipelineBatch = 500
 
+// BuildCorpus builds the in-memory query corpus deterministically from the
+// scenario seed without touching Redis. Workers need this so their op
+// streams are seed-stable; `run` (no preload) calls this directly so it
+// can hit an already-populated index without re-writing anything.
+func BuildCorpus(cfg *config.Config) *datagen.Corpus {
+	return datagen.BuildCorpus(
+		cfg.Seed,
+		cfg.Vectors.DescDim, cfg.Vectors.ImgDim, cfg.Vectors.FeatDim, cfg.Vectors.Clusters,
+		2000, 200, 10000, 1000, 200,
+	)
+}
+
 // Preload drops the indexes (if requested), creates them honoring caps, then
 // writes the deterministic product + event corpora. Returns the same Corpus
 // the runtime phases will use, so call sites don't have to re-derive it.
@@ -45,11 +57,7 @@ func Preload(
 		}
 	}
 
-	corpus := datagen.BuildCorpus(
-		cfg.Seed,
-		cfg.Vectors.DescDim, cfg.Vectors.ImgDim, cfg.Vectors.FeatDim, cfg.Vectors.Clusters,
-		2000, 200, 10000, 1000, 200,
-	)
+	corpus := BuildCorpus(cfg)
 
 	if err := schema.CreateProduct(ctx, rdb, schema.ProductIndexOpts{
 		Name:    cfg.Indexes.Product.Name,
