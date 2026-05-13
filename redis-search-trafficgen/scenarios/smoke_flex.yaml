@@ -45,13 +45,13 @@ phases:
     concurrency: 16
     op_timeout: 5s
 
-# Flex restricts the op set: FT.AGGREGATE and FT.HYBRID are rejected; only
-# text / prefix / KNN are exercised. Weights below would also work in any
-# scenario — unsupported ops are silently dropped from the registry.
+# Flex restricts the op set: FT.AGGREGATE, FT.HYBRID, and prefix queries
+# (@title:hel*) are server-rejected, so the registry drops them and only
+# text + KNN remain. Weights below for ops the registry drops would just
+# log a "ignoring mix entries that aren't registered" warning.
 mix:
-  ft_search_text:     50
-  ft_search_prefix:   20
-  ft_search_knn:      30
+  ft_search_text: 60
+  ft_search_knn:  40
 
 # Flex strips every signal these assertions need (no field returns under
 # NOCONTENT, no FLAT side index for the recall ground truth, no FT.HYBRID).

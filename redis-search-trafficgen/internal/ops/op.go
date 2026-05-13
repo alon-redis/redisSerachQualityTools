@@ -84,15 +84,23 @@ func ClassifyError(err error) string {
 }
 
 // Registry returns every op enabled in the MVP, keyed by name. On Flex
-// (Search-on-Disk) the registry drops FT.AGGREGATE and FT.HYBRID — both are
-// rejected by the Flex query path.
+// (Search-on-Disk) the registry drops the ops the server hard-rejects:
+//   - FT.HYBRID:    "FT.HYBRID is not supported in Redis Flex"
+//   - FT.AGGREGATE: "FT.AGGREGATE is not supported in Redis Flex"
+//   - FT.SEARCH prefix (`@title:hel*`):
+//                   "SEARCH_FLEX_UNSUPPORTED_QUERY Prefix queries are not
+//                   supported on Flex indexes"
+//
+// All three failures are server-side error replies; including these ops in
+// the mix on a Flex endpoint just inflates error counts (or worse, on the
+// typed FTSearch path, surfaces as zero_rate=1 false negatives).
 func Registry(caps *client.Capabilities) map[string]Op {
 	r := map[string]Op{
-		"ft_search_text":   &TextOp{},
-		"ft_search_prefix": &PrefixOp{},
-		"ft_search_knn":    &KNNOp{},
+		"ft_search_text": &TextOp{},
+		"ft_search_knn":  &KNNOp{},
 	}
 	if caps == nil || !caps.IsFlex {
+		r["ft_search_prefix"] = &PrefixOp{}
 		r["ft_aggregate_facet"] = &AggregateFacetOp{}
 	}
 	if caps != nil && caps.HybridSupported && !caps.IsFlex {

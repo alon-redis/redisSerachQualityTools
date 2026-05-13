@@ -1014,16 +1014,17 @@ overrides auto-detection.
 - **`FT.SEARCH` must use `NOCONTENT` or `RETURN 0`** — otherwise rejected.
 - **`SORTBY`, `LOAD`, `SLOP`, `INORDER`, `HIGHLIGHT`, `SUMMARIZE` rejected.**
 - **`FT.AGGREGATE`, `FT.HYBRID`, `FT.CURSOR`, `FT.ALTER` rejected** — drop these ops from the registry when `IsFlex`.
+- **Prefix queries (`@title:hel*`) rejected** with
+  `SEARCH_FLEX_UNSUPPORTED_QUERY Prefix queries are not supported on Flex
+  indexes`. Earlier runs surfaced this as `zero_rate=1.0` rather than an
+  error because the typed `FTSearchWithArgs` path swallows the error and
+  returns an empty `FTSearchResult{Total:0}`. The registry now also drops
+  `ft_search_prefix` when `IsFlex` so the op never fires on Flex.
 - **KNN still works** — `*=>[KNN k @desc_vec $qv]` returns top-K in score order without needing SORTBY.
 - **Sampled assertions don't fire on Flex** because:
-  - `prefix_membership` needs returned titles (blocked by NOCONTENT).
+  - `prefix_membership` needs returned titles (blocked by NOCONTENT) *and* the prefix op itself is blocked.
   - `knn_recall_at_10` needs a FLAT side index for ground truth.
   - `hybrid_top1_in_either_leg` needs `FT.HYBRID`.
-- **Prefix queries returned 0 results** in a 1k-doc Flex smoke despite text
-  queries against the same field working — the Flex prefix-expansion path
-  has different semantics from in-memory and is **TBD** (worth its own
-  investigation; current code just measures latency without asserting on
-  result counts).
 
 ### 21.5 Go / toolchain
 
