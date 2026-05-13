@@ -45,13 +45,21 @@ func (TextOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 		q += " ~comfortable"
 	}
 
-	start := time.Now()
-	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, &redis.FTSearchOptions{
+	flex := IsFlex(w.Caps)
+	opts := &redis.FTSearchOptions{
 		DialectVersion: 2,
-		Return:         []redis.FTSearchReturn{{FieldName: "sku"}, {FieldName: "brand"}},
 		LimitOffset:    0,
 		Limit:          10,
-	}).Result()
+	}
+	if flex {
+		// Flex requires NOCONTENT (or RETURN 0). Fields are unreachable
+		// for return; the assertion path is gated separately.
+		opts.NoContent = true
+	} else {
+		opts.Return = []redis.FTSearchReturn{{FieldName: "sku"}, {FieldName: "brand"}}
+	}
+	start := time.Now()
+	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, opts).Result()
 	lat := time.Since(start)
 	if err != nil {
 		return ExecResult{Latency: lat}, err

@@ -29,6 +29,7 @@ var (
 	flagSeed      uint64
 	flagOutDir    string
 	flagLogLevel  string
+	flagFlex      bool
 )
 
 const trafficGenVersion = "0.1.0-mvp"
@@ -43,6 +44,7 @@ func main() {
 	root.PersistentFlags().Uint64Var(&flagSeed, "seed", 0, "override config seed")
 	root.PersistentFlags().StringVar(&flagOutDir, "out-dir", "", "override metrics.out_dir")
 	root.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "debug|info|warn|error")
+	root.PersistentFlags().BoolVar(&flagFlex, "flex", false, "force Flex (Search-on-Disk) schema + op set regardless of capability probe (same as redis.flex_mode: force)")
 
 	root.AddCommand(cmdPreload(), cmdRun(), cmdFull(), cmdValidate(), cmdDrop(), cmdCapabilities(), cmdVersion())
 
@@ -136,8 +138,9 @@ func cmdCapabilities() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Redis %s   Search %s   JSON=%v   SVS-VAMANA=%v   Hybrid=%v   Hybrid+DIALECT=%v   Dialect3=%v\n",
-				caps.RedisVersion, caps.SearchVersion, caps.HasJSON, caps.SVSVamana,
+			caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+			fmt.Printf("Redis %s   Search %s   JSON=%v   Flex=%v   SVS-VAMANA=%v   Hybrid=%v   Hybrid+DIALECT=%v   Dialect3=%v\n",
+				caps.RedisVersion, caps.SearchVersion, caps.HasJSON, caps.IsFlex, caps.SVSVamana,
 				caps.HybridSupported, caps.HybridAcceptsDialect, caps.Dialect3)
 			return nil
 		},
@@ -164,10 +167,15 @@ func cmdDrop() *cobra.Command {
 				return err
 			}
 			defer rdb.Close()
-			if err := schema.DropProduct(ctx, rdb, cfg.Indexes.Product.Name); err != nil {
+			caps, _ := client.Probe(ctx, rdb)
+			flex := false
+			if caps != nil {
+				flex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+			}
+			if err := schema.DropProduct(ctx, rdb, cfg.Indexes.Product.Name, flex); err != nil {
 				return err
 			}
-			if err := schema.DropEvent(ctx, rdb, cfg.Indexes.Event.Name); err != nil {
+			if err := schema.DropEvent(ctx, rdb, cfg.Indexes.Event.Name, flex); err != nil {
 				return err
 			}
 			fmt.Println("dropped")
@@ -249,8 +257,10 @@ func doPreload(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 	if err != nil {
 		return err
 	}
+	caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
 	log.Info("capabilities probed",
 		"redis", caps.RedisVersion, "search", caps.SearchVersion,
+		"flex", caps.IsFlex, "flex_mode", cfg.Redis.FlexMode,
 		"svs_vamana", caps.SVSVamana, "hybrid", caps.HybridSupported,
 		"hybrid_dialect", caps.HybridAcceptsDialect)
 	if _, err := runner.Preload(ctx, rdb, cfg, caps, log); err != nil {
@@ -271,8 +281,10 @@ func doRun(ctx context.Context, cfg *config.Config, log *slog.Logger, withPreloa
 	if err != nil {
 		return err
 	}
+	caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
 	log.Info("capabilities probed",
 		"redis", caps.RedisVersion, "search", caps.SearchVersion,
+		"flex", caps.IsFlex, "flex_mode", cfg.Redis.FlexMode,
 		"svs_vamana", caps.SVSVamana, "hybrid", caps.HybridSupported,
 		"hybrid_dialect", caps.HybridAcceptsDialect)
 

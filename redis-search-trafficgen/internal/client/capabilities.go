@@ -30,6 +30,32 @@ type Capabilities struct {
 const probeIndexSVS = "idx:_probe_svs"
 const probeIndexHybrid = "idx:_probe_hybrid"
 
+// FlexModeAuto / FlexModeForce / FlexModeDisable mirror the YAML
+// redis.flex_mode values.
+const (
+	FlexModeAuto    = "auto"
+	FlexModeForce   = "force"
+	FlexModeDisable = "disable"
+)
+
+// ResolveFlex picks the final IsFlex value by combining the capability
+// probe outcome with the configured flex_mode (and an optional `--flex`
+// CLI force toggle). Auto trusts the probe; force always returns true;
+// disable always returns false.
+func ResolveFlex(probed bool, mode string, cliForce bool) bool {
+	if cliForce {
+		return true
+	}
+	switch mode {
+	case FlexModeForce:
+		return true
+	case FlexModeDisable:
+		return false
+	default: // auto / unset
+		return probed
+	}
+}
+
 // Probe runs the full capability discovery sequence.
 func Probe(ctx context.Context, c redis.UniversalClient) (*Capabilities, error) {
 	caps := &Capabilities{}

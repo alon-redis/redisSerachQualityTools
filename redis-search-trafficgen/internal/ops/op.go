@@ -83,18 +83,27 @@ func ClassifyError(err error) string {
 	}
 }
 
-// Registry returns every op enabled in the MVP, keyed by name.
+// Registry returns every op enabled in the MVP, keyed by name. On Flex
+// (Search-on-Disk) the registry drops FT.AGGREGATE and FT.HYBRID — both are
+// rejected by the Flex query path.
 func Registry(caps *client.Capabilities) map[string]Op {
 	r := map[string]Op{
-		"ft_search_text":     &TextOp{},
-		"ft_search_prefix":   &PrefixOp{},
-		"ft_search_knn":      &KNNOp{},
-		"ft_aggregate_facet": &AggregateFacetOp{},
+		"ft_search_text":   &TextOp{},
+		"ft_search_prefix": &PrefixOp{},
+		"ft_search_knn":    &KNNOp{},
 	}
-	if caps != nil && caps.HybridSupported {
+	if caps == nil || !caps.IsFlex {
+		r["ft_aggregate_facet"] = &AggregateFacetOp{}
+	}
+	if caps != nil && caps.HybridSupported && !caps.IsFlex {
 		r["ft_hybrid_rrf"] = &HybridRRFOp{}
 	}
 	return r
+}
+
+// IsFlex pulls the IsFlex flag off a (possibly nil) capabilities pointer.
+func IsFlex(caps *client.Capabilities) bool {
+	return caps != nil && caps.IsFlex
 }
 
 // EscapeTagValue applies the painPoints-prescribed escaping for TAG values

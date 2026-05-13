@@ -1,0 +1,89 @@
+name: smoke_flex
+seed: 1
+
+redis:
+  addrs: ["127.0.0.1:6379"]
+  protocol: 2
+  pool_size: 32
+  read_timeout: 10s
+  write_timeout: 10s
+  dial_timeout: 5s
+  # Force Flex (Search-on-Disk) schema + op set regardless of probe result.
+  # Use `auto` to trust the capability probe, `disable` to never use Flex.
+  flex_mode: force
+
+dataset:
+  products: 1000
+  events:   5000
+  preload:  true
+  drop_indexes: true
+  flush_db: false
+
+indexes:
+  product:
+    name: idx:product
+    prefix: "product:"
+  event:
+    name: idx:event
+    prefix: "event:"
+
+vectors:
+  desc_dim:   384
+  img_dim:    512
+  feat_dim:   8
+  clusters:   50
+
+phases:
+  - name: warmup
+    duration: 10s
+    target_qps: 200
+    concurrency: 8
+    op_timeout: 5s
+  - name: steady
+    duration: 30s
+    target_qps: 500
+    concurrency: 16
+    op_timeout: 5s
+
+# Flex restricts the op set: FT.AGGREGATE and FT.HYBRID are rejected; only
+# text / prefix / KNN are exercised. Weights below would also work in any
+# scenario — unsupported ops are silently dropped from the registry.
+mix:
+  ft_search_text:     50
+  ft_search_prefix:   20
+  ft_search_knn:      30
+
+# Flex strips every signal these assertions need (no field returns under
+# NOCONTENT, no FLAT side index for the recall ground truth, no FT.HYBRID).
+# The runner skips them automatically when IsFlex; declaring them here is
+# harmless.
+assertions:
+  bm25_descending:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+  prefix_membership:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+  knn_recall_at_10:
+    enabled: false
+    sample_rate: 0.0
+    min_recall: 0.0
+    severity: warn
+  hybrid_top1_in_either_leg:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+
+coverage:
+  min_features_exercised: 0
+
+metrics:
+  out_dir: "./out"
+  histogram_significant_digits: 3
+  histogram_max_value_ms: 60000
+
+logging:
+  level: info
+  format: console

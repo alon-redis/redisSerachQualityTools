@@ -35,11 +35,12 @@ func Preload(
 		}
 	}
 
+	flex := caps != nil && caps.IsFlex
 	if cfg.Dataset.DropIndexes {
-		if err := schema.DropProduct(ctx, rdb, cfg.Indexes.Product.Name); err != nil {
+		if err := schema.DropProduct(ctx, rdb, cfg.Indexes.Product.Name, flex); err != nil {
 			return nil, err
 		}
-		if err := schema.DropEvent(ctx, rdb, cfg.Indexes.Event.Name); err != nil {
+		if err := schema.DropEvent(ctx, rdb, cfg.Indexes.Event.Name, flex); err != nil {
 			return nil, err
 		}
 	}
@@ -57,12 +58,14 @@ func Preload(
 		ImgDim:  cfg.Vectors.ImgDim,
 		FeatDim: cfg.Vectors.FeatDim,
 		UseSVS:  caps != nil && caps.SVSVamana,
+		Flex:    flex,
 	}); err != nil {
 		return nil, err
 	}
 	if err := schema.CreateEvent(ctx, rdb, schema.EventIndexOpts{
 		Name:   cfg.Indexes.Event.Name,
 		Prefix: cfg.Indexes.Event.Prefix,
+		Flex:   flex,
 	}); err != nil {
 		return nil, err
 	}
@@ -71,10 +74,10 @@ func Preload(
 		cfg.Seed, cfg.Indexes.Product.Prefix, cfg.Dataset.Products,
 		corpus.DescCentroids, corpus.ImgCentroids, corpus.FeatCentroids,
 	)
-	if err := writeProductsConcurrent(ctx, rdb, products, log); err != nil {
+	if err := writeProductsConcurrent(ctx, rdb, products, log, flex); err != nil {
 		return nil, fmt.Errorf("writing products: %w", err)
 	}
-	log.Info("wrote products", "count", len(products))
+	log.Info("wrote products", "count", len(products), "flex", flex)
 
 	events := datagen.GenEvents(cfg.Seed, cfg.Indexes.Event.Prefix, cfg.Dataset.Events, cfg.Dataset.Products)
 	if err := writeEventsConcurrent(ctx, rdb, events, log); err != nil {
@@ -92,7 +95,7 @@ func Preload(
 	return corpus, nil
 }
 
-func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.ProductDoc, log *slog.Logger) error {
+func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.ProductDoc, log *slog.Logger, flex bool) error {
 	const workers = 8
 	jobs := make(chan []datagen.ProductDoc, workers*2)
 	errs := make(chan error, workers)
@@ -105,6 +108,11 @@ func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, doc
 			for batch := range jobs {
 				pipe := rdb.Pipeline()
 				for _, d := range batch {
+					if flex {
+						// Flex requires HASH storage with vectors as raw FP32 bytes.
+						pipe.HSet(ctx, d.Key, d.Product.FlatHashFlex()...)
+						continue
+					}
 					b, err := json.Marshal(d.Product)
 					if err != nil {
 						errs <- err

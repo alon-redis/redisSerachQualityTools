@@ -34,6 +34,38 @@ type Product struct {
 // Kept here so the anchor stays trivially findable across all populators.
 const AnchorTitle = "Alon Shmuely QA architect"
 
+// FlatHashFlex projects a Product into the [field, value, ...] sequence
+// HSET expects for the Flex (HASH-backed) idx:product. Vectors are encoded
+// as little-endian FP32 bytes; FLOAT16 storage isn't supported on Flex.
+// Non-indexed fields (price, rating, created_ts, etc.) are still written so
+// callers can read them back if needed.
+func (p Product) FlatHashFlex() []interface{} {
+	cats := ""
+	for i, c := range p.Categories {
+		if i > 0 {
+			cats += "|"
+		}
+		cats += c
+	}
+	return []interface{}{
+		"sku", p.SKU,
+		"brand", p.Brand,
+		"categories", cats,
+		"title", p.Title,
+		"description", p.Description,
+		"in_stock", p.InStock,
+		"internal_notes", p.InternalNotes,
+		"price", p.Price,
+		"rating", p.Rating,
+		"created_ts", p.CreatedTS,
+		"store_location", p.StoreLocation,
+		"pickup_zone", p.PickupZone,
+		"desc_vec", F32ToBytesLE(p.DescEmbedding),
+		"img_vec", F32ToBytesLE(p.ImgEmbedding),
+		"feat_vec", F32ToBytesLE(p.FeatEmbedding),
+	}
+}
+
 // ProductKey returns the stable Redis key for product index `idx`.
 func ProductKey(prefix string, master uint64, idx int) string {
 	h := sha1.New()

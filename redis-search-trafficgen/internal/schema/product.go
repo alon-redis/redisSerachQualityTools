@@ -14,17 +14,21 @@ import (
 
 // ProductIndexOpts shapes idx:product based on capabilities probed at startup.
 type ProductIndexOpts struct {
-	Name      string
-	Prefix    string
-	DescDim   int
-	ImgDim    int
-	FeatDim   int
-	UseSVS    bool // false → fall back to HNSW FLOAT16 for img_vec
+	Name    string
+	Prefix  string
+	DescDim int
+	ImgDim  int
+	FeatDim int
+	UseSVS  bool // false → fall back to HNSW FLOAT16 for img_vec
+	Flex    bool // true → use HASH-backed, Flex-compatible schema
 }
 
 // CreateProduct issues FT.CREATE for idx:product. Idempotent only when
 // preceded by FT.DROPINDEX; caller's job to drop.
 func CreateProduct(ctx context.Context, rdb redis.UniversalClient, o ProductIndexOpts) error {
+	if o.Flex {
+		return createProductFlex(ctx, rdb, o)
+	}
 	args := []interface{}{
 		"FT.CREATE", o.Name,
 		"ON", "JSON", "PREFIX", "1", o.Prefix,
@@ -84,10 +88,58 @@ func CreateProduct(ctx context.Context, rdb redis.UniversalClient, o ProductInde
 	return nil
 }
 
+// createProductFlex builds an FT.CREATE that satisfies every Search-on-Disk
+// restriction probed against Redis 8.6.2 Flex:
+//
+//   - `ON HASH` only (JSON-backed indexes rejected).
+//   - `SKIPINITIALSCAN` required.
+//   - HNSW vectors must carry M / EF_CONSTRUCTION / EF_RUNTIME / RERANK TRUE.
+//   - FLOAT16 vectors are rejected → FP32 only.
+//   - FLAT and SVS-VAMANA vector types are rejected.
+//   - NUMERIC, GEO, GEOSHAPE fields are rejected.
+//   - NOINDEX is fine; SORTABLE is dropped because the matching ops can't use SORTBY anyway.
+//
+// The dropped fields (price, rating, created_ts, store_location, pickup_zone,
+// internal_notes, feat_embedding) are still written to the hash but go
+// unindexed.
+func createProductFlex(ctx context.Context, rdb redis.UniversalClient, o ProductIndexOpts) error {
+	args := []interface{}{
+		"FT.CREATE", o.Name,
+		"ON", "HASH", "PREFIX", "1", o.Prefix,
+		"SKIPINITIALSCAN",
+		"SCHEMA",
+		"sku", "TAG", "CASESENSITIVE",
+		"brand", "TAG",
+		"categories", "TAG", "SEPARATOR", "|",
+		"title", "TEXT", "WEIGHT", "5.0", "NOSTEM",
+		"description", "TEXT",
+		"in_stock", "TAG",
+		"desc_vec", "VECTOR", "HNSW", "14",
+		"TYPE", "FLOAT32",
+		"DIM", strconv.Itoa(o.DescDim),
+		"DISTANCE_METRIC", "COSINE",
+		"M", "16", "EF_CONSTRUCTION", "200", "EF_RUNTIME", "10", "RERANK", "TRUE",
+		"img_vec", "VECTOR", "HNSW", "14",
+		"TYPE", "FLOAT32",
+		"DIM", strconv.Itoa(o.ImgDim),
+		"DISTANCE_METRIC", "IP",
+		"M", "16", "EF_CONSTRUCTION", "200", "EF_RUNTIME", "10", "RERANK", "TRUE",
+	}
+	if _, err := rdb.Do(ctx, args...).Result(); err != nil {
+		return fmt.Errorf("FT.CREATE %s (flex): %w", o.Name, err)
+	}
+	return nil
+}
+
 // DropProduct removes the product index. Returns nil if the index didn't
-// exist (idempotent).
-func DropProduct(ctx context.Context, rdb redis.UniversalClient, name string) error {
-	_, err := rdb.Do(ctx, "FT.DROPINDEX", name, "DD").Result()
+// exist (idempotent). Flex rejects `DD` (Search-on-Disk doesn't tie the
+// index drop to a doc DEL pass) so we omit it there.
+func DropProduct(ctx context.Context, rdb redis.UniversalClient, name string, flex bool) error {
+	args := []interface{}{"FT.DROPINDEX", name}
+	if !flex {
+		args = append(args, "DD")
+	}
+	_, err := rdb.Do(ctx, args...).Result()
 	if err != nil && !isUnknownIndex(err) {
 		return fmt.Errorf("FT.DROPINDEX %s: %w", name, err)
 	}

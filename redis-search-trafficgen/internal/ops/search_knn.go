@@ -30,20 +30,25 @@ const knnK = 10
 func (KNNOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 	qv := w.Corpus.QueryVecDesc[w.RNG.IntN(len(w.Corpus.QueryVecDesc))]
 	q := "*=>[KNN 10 @desc_vec $qv AS score]"
-	start := time.Now()
-	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, &redis.FTSearchOptions{
+	flex := IsFlex(w.Caps)
+	opts := &redis.FTSearchOptions{
 		DialectVersion: 2,
 		Params: map[string]interface{}{
 			"qv": datagen.F32ToBytesLE(qv),
 		},
-		Return: []redis.FTSearchReturn{
-			{FieldName: "sku"},
-			{FieldName: "score"},
-		},
-		SortBy:      []redis.FTSearchSortBy{{FieldName: "score", Asc: true}},
 		LimitOffset: 0,
 		Limit:       knnK,
-	}).Result()
+	}
+	if flex {
+		// Flex blocks SORTBY entirely; KNN inherently returns results in
+		// score order so no explicit sort is needed. NOCONTENT is also required.
+		opts.NoContent = true
+	} else {
+		opts.Return = []redis.FTSearchReturn{{FieldName: "sku"}, {FieldName: "score"}}
+		opts.SortBy = []redis.FTSearchSortBy{{FieldName: "score", Asc: true}}
+	}
+	start := time.Now()
+	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, opts).Result()
 	lat := time.Since(start)
 	if err != nil {
 		return ExecResult{Latency: lat}, err

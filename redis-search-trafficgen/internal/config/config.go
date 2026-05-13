@@ -66,6 +66,21 @@ type RedisConfig struct {
 	DialTimeout  Duration  `yaml:"dial_timeout"`
 	TLS          TLSConfig `yaml:"tls"`
 	Cluster      bool      `yaml:"cluster"`
+
+	// FlexMode controls how the generator decides whether to use the
+	// Search-on-Disk (Flex) compatible schema + op set.
+	//
+	//   "auto"    (default) — trust the capability probe. Auto-detects Flex
+	//                          and switches schema, op registry, NOCONTENT,
+	//                          and assertion gating accordingly.
+	//   "force"             — always use the Flex-compatible schema, even
+	//                          if the probe says the server isn't Flex.
+	//                          Useful for testing the Flex code path or
+	//                          for `validate` runs without Redis access.
+	//   "disable"           — never use the Flex schema, even if the probe
+	//                          says the server is Flex (FT.CREATE will
+	//                          likely fail; surface that failure loudly).
+	FlexMode string `yaml:"flex_mode"`
 }
 
 type TLSConfig struct {
@@ -165,6 +180,7 @@ func defaultConfig() *Config {
 			ReadTimeout:  Duration(3 * time.Second),
 			WriteTimeout: Duration(3 * time.Second),
 			DialTimeout:  Duration(5 * time.Second),
+			FlexMode:     "auto",
 		},
 		Dataset: DatasetConfig{
 			Products:    100000,
@@ -228,6 +244,15 @@ func Validate(c *Config) error {
 	}
 	if c.Dataset.Products < c.Vectors.Clusters*2 {
 		return fmt.Errorf("dataset.products (%d) must be >= 2 * vectors.clusters (%d)", c.Dataset.Products, c.Vectors.Clusters)
+	}
+	switch c.Redis.FlexMode {
+	case "", "auto", "force", "disable":
+		// ok
+	default:
+		return fmt.Errorf("redis.flex_mode must be one of: auto, force, disable (got %q)", c.Redis.FlexMode)
+	}
+	if c.Redis.FlexMode == "" {
+		c.Redis.FlexMode = "auto"
 	}
 	for i, ph := range c.Phases {
 		if ph.Name == "" {

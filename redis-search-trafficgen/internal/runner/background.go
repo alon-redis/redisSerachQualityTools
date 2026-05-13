@@ -168,11 +168,16 @@ func (r *Runner) anchorVerifyOnce(ctx context.Context) {
 	q := "@title:" + escapeDoubleQuotes(`"`+datagen.AnchorTitle+`"`)
 	pollCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	res, err := r.Rdb.FTSearchWithArgs(pollCtx, r.Cfg.Indexes.Product.Name, q, &redis.FTSearchOptions{
+	opts := &redis.FTSearchOptions{
 		DialectVersion: 2,
 		LimitOffset:    0,
 		Limit:          1,
-	}).Result()
+	}
+	// Flex rejects FT.SEARCH without NOCONTENT / RETURN 0.
+	if r.Caps != nil && r.Caps.IsFlex {
+		opts.NoContent = true
+	}
+	res, err := r.Rdb.FTSearchWithArgs(pollCtx, r.Cfg.Indexes.Product.Name, q, opts).Result()
 	total := -1
 	if err == nil {
 		total = res.Total

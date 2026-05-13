@@ -38,13 +38,19 @@ func (PrefixOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 	prefix := strings.ToLower(term[:plen])
 	q := fmt.Sprintf("@title:%s*", prefix)
 
-	start := time.Now()
-	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, &redis.FTSearchOptions{
+	flex := IsFlex(w.Caps)
+	opts := &redis.FTSearchOptions{
 		DialectVersion: 2,
-		Return:         []redis.FTSearchReturn{{FieldName: "title"}, {FieldName: "sku"}},
 		LimitOffset:    0,
 		Limit:          10,
-	}).Result()
+	}
+	if flex {
+		opts.NoContent = true
+	} else {
+		opts.Return = []redis.FTSearchReturn{{FieldName: "title"}, {FieldName: "sku"}}
+	}
+	start := time.Now()
+	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, opts).Result()
 	lat := time.Since(start)
 	if err != nil {
 		return ExecResult{Latency: lat}, err

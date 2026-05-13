@@ -75,6 +75,13 @@ func (w *Worker) executeOne(ctx context.Context, op ops.Op) {
 
 func (w *Worker) runAssertions(ctx context.Context, opName string, res ops.ExecResult) {
 	cfg := w.Runner.Cfg
+	// Flex strips every signal the assertions need: prefix titles aren't
+	// returned (NOCONTENT forced), FLAT feat_vec doesn't exist for the
+	// recall side query, and FT.HYBRID itself is unsupported. Skip
+	// assertions wholesale rather than emitting noisy false negatives.
+	if w.Runner.Caps != nil && w.Runner.Caps.IsFlex {
+		return
+	}
 
 	switch opName {
 	case "ft_search_prefix":
