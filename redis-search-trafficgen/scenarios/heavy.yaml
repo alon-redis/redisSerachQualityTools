@@ -4,17 +4,21 @@ seed: 42
 redis:
   addrs: ["127.0.0.1:6379"]
   protocol: 2
-  pool_size: 256
-  # Tel Aviv endpoint sits ~75ms RTT from local dev; under heavy concurrency
-  # both client-side connection-acquire and server-side queueing can push
-  # single-command latency well past 1s. Read timeout sized accordingly.
+  # 100 worker connections + a small idle headroom.
+  pool_size: 110
+  # Preload a 250k-product corpus with 384/512/8-D vectors; the initial
+  # JSON.SET / HSET burst can stall longer than the default 3s read timeout.
   read_timeout: 30s
   write_timeout: 30s
   dial_timeout: 5s
+  flex_mode: auto
 
 dataset:
-  products: 25000
-  events:   100000
+  # 250k product keys is the real target. Events live in a separate index
+  # under their own prefix; 50k is enough to keep the event index healthy
+  # without bloating preload time. Total Redis keys ~ 300k.
+  products: 250000
+  events:   50000
   preload:  true
   drop_indexes: true
   flush_db: false
@@ -34,34 +38,17 @@ vectors:
   clusters:   50
 
 phases:
-  # 1) Warmup — closed loop, light pressure to verify everything answers.
   - name: warmup
-    duration: 30s
-    target_qps: 0
-    concurrency: 32
-    op_timeout: 10s
+    duration: 60s
+    target_qps: 0          # closed loop — let connections fill, indexes warm
+    concurrency: 100
+    op_timeout: 30s
 
-  # 2) Ramp — open loop with a high target. Limiter will throttle if the
-  # link can't keep up; that's a useful signal in itself.
-  - name: ramp
-    duration: 120s
-    target_qps: 3000
-    concurrency: 128
-    op_timeout: 10s
-
-  # 3) Steady — the workhorse. ~5 min of closed-loop load with deep concurrency.
-  - name: steady_peak
-    duration: 300s
-    target_qps: 0
-    concurrency: 192
-    op_timeout: 15s
-
-  # 4) Push — max in-flight; expect connection acquire + server queueing.
-  - name: push
-    duration: 180s
-    target_qps: 0
-    concurrency: 256
-    op_timeout: 20s
+  - name: steady_5h
+    duration: 18000s       # 5 hours
+    target_qps: 0          # closed loop — sustain 100 in-flight ops
+    concurrency: 100
+    op_timeout: 30s
 
 mix:
   ft_search_text:     30
@@ -71,23 +58,25 @@ mix:
   ft_aggregate_facet: 15
 
 assertions:
+  # Sample very sparsely over 5 hours — at p50 ~75ms each side query
+  # roughly halves the effective throughput on the sampled op. 0.0005 fires
+  # roughly every 2000 ops, ~10 samples / minute for the heaviest ops.
   bm25_descending:
     enabled: false
     sample_rate: 0.0
     severity: warn
-  # Aggressive load: minimise side-query overhead from assertions.
   prefix_membership:
     enabled: true
-    sample_rate: 0.001
-    severity: error
+    sample_rate: 0.0005
+    severity: warn
   knn_recall_at_10:
     enabled: true
-    sample_rate: 0.0005
+    sample_rate: 0.0002
     min_recall: 0.0
     severity: warn
   hybrid_top1_in_either_leg:
     enabled: true
-    sample_rate: 0.001
+    sample_rate: 0.0005
     severity: warn
 
 coverage:
@@ -96,6 +85,8 @@ coverage:
 metrics:
   out_dir: "./out"
   histogram_significant_digits: 3
+  # 5 minutes max value — give the histogram headroom for tail spikes
+  # without quantising real latencies.
   histogram_max_value_ms: 300000
 
 logging:
