@@ -1,0 +1,103 @@
+name: heavy
+seed: 42
+
+redis:
+  addrs: ["127.0.0.1:6379"]
+  protocol: 2
+  pool_size: 256
+  # Tel Aviv endpoint sits ~75ms RTT from local dev; under heavy concurrency
+  # both client-side connection-acquire and server-side queueing can push
+  # single-command latency well past 1s. Read timeout sized accordingly.
+  read_timeout: 30s
+  write_timeout: 30s
+  dial_timeout: 5s
+
+dataset:
+  products: 25000
+  events:   100000
+  preload:  true
+  drop_indexes: true
+  flush_db: false
+
+indexes:
+  product:
+    name: idx:product
+    prefix: "product:"
+  event:
+    name: idx:event
+    prefix: "event:"
+
+vectors:
+  desc_dim:   384
+  img_dim:    512
+  feat_dim:   8
+  clusters:   50
+
+phases:
+  # 1) Warmup — closed loop, light pressure to verify everything answers.
+  - name: warmup
+    duration: 30s
+    target_qps: 0
+    concurrency: 32
+    op_timeout: 10s
+
+  # 2) Ramp — open loop with a high target. Limiter will throttle if the
+  # link can't keep up; that's a useful signal in itself.
+  - name: ramp
+    duration: 120s
+    target_qps: 3000
+    concurrency: 128
+    op_timeout: 10s
+
+  # 3) Steady — the workhorse. ~5 min of closed-loop load with deep concurrency.
+  - name: steady_peak
+    duration: 300s
+    target_qps: 0
+    concurrency: 192
+    op_timeout: 15s
+
+  # 4) Push — max in-flight; expect connection acquire + server queueing.
+  - name: push
+    duration: 180s
+    target_qps: 0
+    concurrency: 256
+    op_timeout: 20s
+
+mix:
+  ft_search_text:     30
+  ft_search_prefix:   10
+  ft_search_knn:      25
+  ft_hybrid_rrf:      20
+  ft_aggregate_facet: 15
+
+assertions:
+  bm25_descending:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+  # Aggressive load: minimise side-query overhead from assertions.
+  prefix_membership:
+    enabled: true
+    sample_rate: 0.001
+    severity: error
+  knn_recall_at_10:
+    enabled: true
+    sample_rate: 0.0005
+    min_recall: 0.0
+    severity: warn
+  hybrid_top1_in_either_leg:
+    enabled: true
+    sample_rate: 0.001
+    severity: warn
+
+coverage:
+  min_features_exercised: 0
+
+metrics:
+  out_dir: "./out"
+  histogram_significant_digits: 3
+  histogram_max_value_ms: 300000
+
+logging:
+  level: info
+  format: console
