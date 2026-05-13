@@ -18,7 +18,6 @@ import (
 	"github.com/alon-redis/redis-search-trafficgen/internal/assertx"
 	"github.com/alon-redis/redis-search-trafficgen/internal/client"
 	"github.com/alon-redis/redis-search-trafficgen/internal/config"
-	"github.com/alon-redis/redis-search-trafficgen/internal/datagen"
 	"github.com/alon-redis/redis-search-trafficgen/internal/report"
 	"github.com/alon-redis/redis-search-trafficgen/internal/runner"
 	"github.com/alon-redis/redis-search-trafficgen/internal/schema"
@@ -289,17 +288,12 @@ func doRun(ctx context.Context, cfg *config.Config, log *slog.Logger, withPreloa
 		"svs_vamana", caps.SVSVamana, "hybrid", caps.HybridSupported,
 		"hybrid_dialect", caps.HybridAcceptsDialect)
 
-	var corpus *datagen.Corpus
-	if withPreload {
-		corpus, err = runner.Preload(ctx, rdb, cfg, caps, log)
-		if err != nil {
+	corpus, err := runner.Preload(ctx, rdb, cfg, caps, log)
+	if err != nil {
+		if !withPreload {
 			return err
 		}
-	} else {
-		corpus = runner.BuildCorpus(cfg)
-		log.Info("preload skipped; reusing existing index + data",
-			"index", cfg.Indexes.Product.Name,
-			"products", cfg.Dataset.Products)
+		return err
 	}
 
 	startedAt := time.Now()
