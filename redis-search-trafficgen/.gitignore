@@ -1,0 +1,5 @@
+bin/
+out/
+*.summary.json
+*.hgrm
+.DS_Store

@@ -1,0 +1,87 @@
+name: smoke
+seed: 1
+
+redis:
+  addrs: ["127.0.0.1:6379"]
+  # Protocol 2 (RESP2) — go-redis v9.7's typed FTSearchWithArgs RESP3 parser
+  # returns total=0 against Redis 8.6.x even when docs match. Stick to RESP2
+  # for the typed helpers; raw rdb.Do paths are unaffected either way.
+  protocol: 2
+  pool_size: 32
+  read_timeout: 5s
+  write_timeout: 5s
+  dial_timeout: 5s
+
+dataset:
+  products: 1000
+  events:   5000
+  preload:  true
+  drop_indexes: true
+  flush_db: false
+
+indexes:
+  product:
+    name: idx:product
+    prefix: "product:"
+  event:
+    name: idx:event
+    prefix: "event:"
+
+vectors:
+  desc_dim:   384
+  img_dim:    512
+  feat_dim:   8
+  clusters:   50
+
+phases:
+  - name: warmup
+    duration: 10s
+    target_qps: 200
+    concurrency: 8
+    op_timeout: 3s
+  - name: steady
+    duration: 30s
+    target_qps: 500
+    concurrency: 16
+    op_timeout: 3s
+
+mix:
+  ft_search_text:     25
+  ft_search_prefix:   10
+  ft_search_knn:      20
+  ft_hybrid_rrf:      15
+  ft_aggregate_facet: 10
+
+assertions:
+  bm25_descending:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+  prefix_membership:
+    enabled: true
+    sample_rate: 0.05
+    severity: error
+  knn_recall_at_10:
+    # min_recall: 0.0 — HNSW desc_vec (COSINE, 384-D) and FLAT feat_vec (L2,
+    # 8-D) live in unrelated spaces, so the side query is mainly a "did the
+    # FLAT ground-truth path execute?" smoke check, not a numerical bound.
+    enabled: true
+    sample_rate: 0.02
+    min_recall: 0.0
+    severity: warn
+  hybrid_top1_in_either_leg:
+    enabled: true
+    sample_rate: 0.05
+    severity: warn
+
+coverage:
+  min_features_exercised: 0
+
+metrics:
+  out_dir: "./out"
+  histogram_significant_digits: 3
+  histogram_max_value_ms: 60000
+
+logging:
+  level: info
+  format: console

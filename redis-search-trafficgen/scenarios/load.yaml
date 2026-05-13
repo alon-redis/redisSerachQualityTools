@@ -1,0 +1,94 @@
+name: load
+seed: 7
+
+redis:
+  addrs: ["127.0.0.1:6379"]
+  protocol: 2
+  pool_size: 128
+  read_timeout: 10s
+  write_timeout: 10s
+  dial_timeout: 5s
+
+dataset:
+  products: 10000
+  events:   50000
+  preload:  true
+  drop_indexes: true
+  flush_db: false
+
+indexes:
+  product:
+    name: idx:product
+    prefix: "product:"
+  event:
+    name: idx:event
+    prefix: "event:"
+
+vectors:
+  desc_dim:   384
+  img_dim:    512
+  feat_dim:   8
+  clusters:   50
+
+phases:
+  - name: warmup
+    duration: 30s
+    target_qps: 500
+    concurrency: 16
+    op_timeout: 5s
+
+  - name: ramp
+    duration: 60s
+    target_qps: 1500
+    concurrency: 48
+    op_timeout: 5s
+
+  - name: steady_open
+    duration: 180s
+    target_qps: 2500
+    concurrency: 96
+    op_timeout: 5s
+
+  - name: closed_loop_peak
+    duration: 60s
+    target_qps: 0
+    concurrency: 128
+    op_timeout: 5s
+
+mix:
+  ft_search_text:     30
+  ft_search_prefix:   10
+  ft_search_knn:      25
+  ft_hybrid_rrf:      20
+  ft_aggregate_facet: 15
+
+assertions:
+  bm25_descending:
+    enabled: false
+    sample_rate: 0.0
+    severity: warn
+  prefix_membership:
+    enabled: true
+    sample_rate: 0.005
+    severity: error
+  knn_recall_at_10:
+    enabled: true
+    sample_rate: 0.001
+    min_recall: 0.0
+    severity: warn
+  hybrid_top1_in_either_leg:
+    enabled: true
+    sample_rate: 0.005
+    severity: warn
+
+coverage:
+  min_features_exercised: 0
+
+metrics:
+  out_dir: "./out"
+  histogram_significant_digits: 3
+  histogram_max_value_ms: 120000
+
+logging:
+  level: info
+  format: console
