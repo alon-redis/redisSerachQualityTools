@@ -58,17 +58,34 @@ func (TextOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 	} else {
 		opts.Return = []redis.FTSearchReturn{{FieldName: "sku"}, {FieldName: "brand"}}
 	}
+	var reqStr string
+	if w.Debug {
+		dbgArgs := []interface{}{"FT.SEARCH", w.Cfg.Indexes.Product.Name, q}
+		if flex {
+			dbgArgs = append(dbgArgs, "NOCONTENT")
+		} else {
+			dbgArgs = append(dbgArgs, "RETURN", "2", "sku", "brand")
+		}
+		dbgArgs = append(dbgArgs, "LIMIT", "0", "10", "DIALECT", "2")
+		reqStr = formatRequestArgs(dbgArgs)
+	}
 	start := time.Now()
 	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, opts).Result()
 	lat := time.Since(start)
 	if err != nil {
-		return ExecResult{Latency: lat}, err
+		return ExecResult{Latency: lat, RequestString: reqStr}, err
 	}
-	return ExecResult{
+	ids := docIDs(res.Docs)
+	out := ExecResult{
 		Latency:     lat,
 		ResultCount: res.Total,
-		TopIDs:      docIDs(res.Docs),
-	}, nil
+		TopIDs:      ids,
+		RequestString: reqStr,
+	}
+	if w.Debug {
+		out.ResponseSummary = formatResponseSummary(ids, res.Total)
+	}
+	return out, nil
 }
 
 func docIDs(docs []redis.Document) []string {

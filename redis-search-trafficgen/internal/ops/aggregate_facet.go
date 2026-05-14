@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/alon-redis/redis-search-trafficgen/internal/coverage"
@@ -31,16 +32,26 @@ func (AggregateFacetOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, 
 		"LIMIT", "0", "20",
 		"DIALECT", "2",
 	}
+	var reqStr string
+	if w.Debug {
+		reqStr = formatRequestArgs(args)
+	}
 	start := time.Now()
 	res, err := w.Rdb.Do(ctx, args...).Result()
 	lat := time.Since(start)
 	if err != nil {
-		return ExecResult{Latency: lat}, err
+		return ExecResult{Latency: lat, RequestString: reqStr}, err
 	}
-	return ExecResult{
-		Latency:     lat,
-		ResultCount: parseAggregateRowCount(res),
-	}, nil
+	total := parseAggregateRowCount(res)
+	out := ExecResult{
+		Latency:       lat,
+		ResultCount:   total,
+		RequestString: reqStr,
+	}
+	if w.Debug {
+		out.ResponseSummary = fmt.Sprintf("groups=%d", total)
+	}
+	return out, nil
 }
 
 func parseAggregateRowCount(res interface{}) int {

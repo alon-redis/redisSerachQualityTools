@@ -49,15 +49,19 @@ func (HybridRRFOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error
 		args = append(args, "DIALECT", "2")
 	}
 
+	var reqStr string
+	if w.Debug {
+		reqStr = formatRequestArgs(args)
+	}
 	start := time.Now()
 	res, err := w.Rdb.Do(ctx, args...).Result()
 	lat := time.Since(start)
 	if err != nil {
-		return ExecResult{Latency: lat}, err
+		return ExecResult{Latency: lat, RequestString: reqStr}, err
 	}
 
 	n, ids := parseHybrid(res)
-	return ExecResult{
+	out := ExecResult{
 		Latency:     lat,
 		ResultCount: n,
 		TopIDs:      ids,
@@ -66,7 +70,12 @@ func (HybridRRFOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error
 			"text_leg": textLeg,
 			"top_ids":  ids,
 		},
-	}, nil
+		RequestString: reqStr,
+	}
+	if w.Debug {
+		out.ResponseSummary = formatResponseSummary(ids, n)
+	}
+	return out, nil
 }
 
 // parseHybrid handles both the RESP3 map shape and the RESP2 flat slice shape

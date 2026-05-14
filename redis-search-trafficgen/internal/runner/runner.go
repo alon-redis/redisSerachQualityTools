@@ -17,6 +17,7 @@ import (
 	"github.com/alon-redis/redis-search-trafficgen/internal/config"
 	"github.com/alon-redis/redis-search-trafficgen/internal/coverage"
 	"github.com/alon-redis/redis-search-trafficgen/internal/datagen"
+	"github.com/alon-redis/redis-search-trafficgen/internal/debug"
 	"github.com/alon-redis/redis-search-trafficgen/internal/metrics"
 	"github.com/alon-redis/redis-search-trafficgen/internal/ops"
 )
@@ -34,6 +35,11 @@ type Runner struct {
 	Log       *slog.Logger
 	Registry  map[string]ops.Op
 	AnchorKey string
+
+	// Debug is the bounded sampler that captures the last N errors + the
+	// N slowest requests when --debug-mode is on. Nil when disabled; all
+	// recorder method calls are nil-safe.
+	Debug *debug.Recorder
 
 	// SyntaxBug is set true (by a worker) if a query_syntax error was ever
 	// observed. Run() returns ErrQuerySyntaxBug at the end if so.

@@ -9,6 +9,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/alon-redis/redis-search-trafficgen/internal/assertx"
+	"github.com/alon-redis/redis-search-trafficgen/internal/debug"
 	"github.com/alon-redis/redis-search-trafficgen/internal/metrics"
 	"github.com/alon-redis/redis-search-trafficgen/internal/ops"
 )
@@ -48,12 +49,14 @@ func (w *Worker) executeOne(ctx context.Context, op ops.Op) {
 	opCtx, cancel := context.WithTimeout(ctx, w.Timeout)
 	defer cancel()
 
+	debugOn := w.Runner.Debug != nil
 	wctx := &ops.WorkerCtx{
 		Rdb:    w.Runner.Rdb,
 		RNG:    w.RNG,
 		Cfg:    w.Runner.Cfg,
 		Corpus: w.Runner.Corpus,
 		Caps:   w.Runner.Caps,
+		Debug:  debugOn,
 	}
 
 	res, err := op.Execute(opCtx, wctx)
@@ -64,10 +67,28 @@ func (w *Worker) executeOne(ctx context.Context, op ops.Op) {
 			atomic.StoreUint32(&w.Runner.syntaxBug, 1)
 			w.Runner.Log.Error("query_syntax error", "op", op.Name(), "err", err)
 		}
+		if debugOn {
+			w.Runner.Debug.RecordError(debug.Entry{
+				When:    time.Now(),
+				Op:      op.Name(),
+				Latency: res.Latency,
+				Request: res.RequestString,
+				Err:     err.Error(),
+			})
+		}
 		return
 	}
 	w.Runner.Metrics.RecordSuccess(op.Name(), res.Latency, res.ResultCount)
 	w.Runner.Coverage.MarkAll(op.Features())
+	if debugOn {
+		w.Runner.Debug.RecordSuccess(debug.Entry{
+			When:     time.Now(),
+			Op:       op.Name(),
+			Latency:  res.Latency,
+			Request:  res.RequestString,
+			Response: res.ResponseSummary,
+		})
+	}
 
 	// Sampled assertions.
 	w.runAssertions(opCtx, op.Name(), res)

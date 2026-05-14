@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -31,13 +32,12 @@ func (KNNOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 	qv := w.Corpus.QueryVecDesc[w.RNG.IntN(len(w.Corpus.QueryVecDesc))]
 	q := "*=>[KNN 10 @desc_vec $qv AS score]"
 	flex := IsFlex(w.Caps)
+	qvBytes := datagen.F32ToBytesLE(qv)
 	opts := &redis.FTSearchOptions{
 		DialectVersion: 2,
-		Params: map[string]interface{}{
-			"qv": datagen.F32ToBytesLE(qv),
-		},
-		LimitOffset: 0,
-		Limit:       knnK,
+		Params:         map[string]interface{}{"qv": qvBytes},
+		LimitOffset:    0,
+		Limit:          knnK,
 	}
 	if flex {
 		// Flex blocks SORTBY entirely; KNN inherently returns results in
@@ -47,14 +47,27 @@ func (KNNOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 		opts.Return = []redis.FTSearchReturn{{FieldName: "sku"}, {FieldName: "score"}}
 		opts.SortBy = []redis.FTSearchSortBy{{FieldName: "score", Asc: true}}
 	}
+	var reqStr string
+	if w.Debug {
+		dbgArgs := []interface{}{"FT.SEARCH", w.Cfg.Indexes.Product.Name, q,
+			"PARAMS", "2", "qv", qvBytes}
+		if flex {
+			dbgArgs = append(dbgArgs, "NOCONTENT")
+		} else {
+			dbgArgs = append(dbgArgs, "RETURN", "2", "sku", "score",
+				"SORTBY", "score")
+		}
+		dbgArgs = append(dbgArgs, "LIMIT", "0", fmt.Sprintf("%d", knnK), "DIALECT", "2")
+		reqStr = formatRequestArgs(dbgArgs)
+	}
 	start := time.Now()
 	res, err := w.Rdb.FTSearchWithArgs(ctx, w.Cfg.Indexes.Product.Name, q, opts).Result()
 	lat := time.Since(start)
 	if err != nil {
-		return ExecResult{Latency: lat}, err
+		return ExecResult{Latency: lat, RequestString: reqStr}, err
 	}
 	skus := skus(res.Docs)
-	return ExecResult{
+	out := ExecResult{
 		Latency:     lat,
 		ResultCount: res.Total,
 		TopIDs:      skus,
@@ -62,7 +75,12 @@ func (KNNOp) Execute(ctx context.Context, w *WorkerCtx) (ExecResult, error) {
 			"qv":   qv,
 			"skus": skus,
 		},
-	}, nil
+		RequestString: reqStr,
+	}
+	if w.Debug {
+		out.ResponseSummary = formatResponseSummary(skus, res.Total)
+	}
+	return out, nil
 }
 
 func skus(docs []redis.Document) []string {

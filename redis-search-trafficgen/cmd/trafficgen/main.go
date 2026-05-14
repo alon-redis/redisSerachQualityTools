@@ -19,6 +19,7 @@ import (
 	"github.com/alon-redis/redis-search-trafficgen/internal/client"
 	"github.com/alon-redis/redis-search-trafficgen/internal/config"
 	"github.com/alon-redis/redis-search-trafficgen/internal/datagen"
+	"github.com/alon-redis/redis-search-trafficgen/internal/debug"
 	"github.com/alon-redis/redis-search-trafficgen/internal/report"
 	"github.com/alon-redis/redis-search-trafficgen/internal/runner"
 	"github.com/alon-redis/redis-search-trafficgen/internal/schema"
@@ -32,6 +33,8 @@ var (
 	flagLogLevel     string
 	flagFlex         bool
 	flagLiveInterval time.Duration
+	flagDebugMode    bool
+	flagDebugFile    string
 )
 
 const trafficGenVersion = "0.1.0-mvp"
@@ -48,6 +51,8 @@ func main() {
 	root.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "debug|info|warn|error")
 	root.PersistentFlags().BoolVar(&flagFlex, "flex", false, "force Flex (Search-on-Disk) schema + op set regardless of capability probe (same as redis.flex_mode: force)")
 	root.PersistentFlags().DurationVar(&flagLiveInterval, "live-interval", 0, "override metrics.live_interval (e.g. 1s, 250ms). 0 = use YAML value. To disable live stats, set the YAML to 0 or pass --live-interval=0 if YAML enables it.")
+	root.PersistentFlags().BoolVar(&flagDebugMode, "debug-mode", false, "capture the last 25 errored requests + the 25 slowest requests, write to --debug-file at end of run")
+	root.PersistentFlags().StringVar(&flagDebugFile, "debug-file", "/tmp/debug.txt", "where --debug-mode writes its capture")
 
 	root.AddCommand(cmdPreload(), cmdRun(), cmdFull(), cmdValidate(), cmdDrop(), cmdCapabilities(), cmdVersion())
 
@@ -314,7 +319,17 @@ func doRun(ctx context.Context, cfg *config.Config, log *slog.Logger, withPreloa
 
 	startedAt := time.Now()
 	rn := runner.New(rdb, cfg, caps, corpus, log)
+	if flagDebugMode {
+		rn.Debug = debug.NewRecorder()
+	}
 	runErr := rn.Run(ctx)
+	if rn.Debug != nil {
+		if n, ferr := rn.Debug.Flush(flagDebugFile); ferr != nil {
+			log.Error("debug flush failed", "path", flagDebugFile, "err", ferr)
+		} else {
+			log.Info("debug capture written", "path", flagDebugFile, "entries", n)
+		}
+	}
 
 	exitCode := 0
 	switch {

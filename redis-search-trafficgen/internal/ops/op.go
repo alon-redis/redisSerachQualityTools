@@ -6,6 +6,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"time"
@@ -30,6 +31,11 @@ type ExecResult struct {
 	// AssertHint is op-specific data the assertion code may need (e.g. the
 	// query vector for a KNN sample, the prefix string for prefix assertions).
 	AssertHint map[string]interface{}
+	// RequestString / ResponseSummary are populated by ops only when the
+	// worker context has Debug = true. Both feed the --debug-mode capture
+	// at end of run; non-debug runs leave them empty.
+	RequestString   string
+	ResponseSummary string
 }
 
 // Op is the polymorphic unit of work.
@@ -46,6 +52,9 @@ type WorkerCtx struct {
 	Cfg    *config.Config
 	Corpus *datagen.Corpus
 	Caps   *client.Capabilities
+	// Debug toggles the per-op request/response capture used by --debug-mode.
+	// When false, ops skip the (small) string-formatting cost.
+	Debug bool
 }
 
 // ClassifyError buckets an error into one of the metrics.ErrClass* constants.
@@ -112,6 +121,41 @@ func Registry(caps *client.Capabilities) map[string]Op {
 // IsFlex pulls the IsFlex flag off a (possibly nil) capabilities pointer.
 func IsFlex(caps *client.Capabilities) bool {
 	return caps != nil && caps.IsFlex
+}
+
+// formatRequestArgs renders a raw FT.* command for --debug-mode capture.
+// Byte slices (e.g. vector PARAMS) are abbreviated as "<N bytes>";
+// strings containing whitespace or RediSearch metacharacters are quoted.
+func formatRequestArgs(args []interface{}) string {
+	var sb strings.Builder
+	for i, a := range args {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		switch v := a.(type) {
+		case []byte:
+			fmt.Fprintf(&sb, "<%d bytes>", len(v))
+		case string:
+			if strings.ContainsAny(v, " ()|") {
+				fmt.Fprintf(&sb, "'%s'", v)
+			} else {
+				sb.WriteString(v)
+			}
+		default:
+			fmt.Fprintf(&sb, "%v", v)
+		}
+	}
+	return sb.String()
+}
+
+// formatResponseSummary produces a one-line description of an op's result.
+// Truncates long ID lists at 5 entries to keep /tmp/debug.txt readable.
+func formatResponseSummary(topIDs []string, total int) string {
+	const maxShow = 5
+	if len(topIDs) <= maxShow {
+		return fmt.Sprintf("total=%d ids=%v", total, topIDs)
+	}
+	return fmt.Sprintf("total=%d ids=%v (...+%d more)", total, topIDs[:maxShow], len(topIDs)-maxShow)
 }
 
 // EscapeTagValue applies the painPoints-prescribed escaping for TAG values
