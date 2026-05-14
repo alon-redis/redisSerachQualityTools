@@ -1,6 +1,7 @@
 package datagen
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -78,24 +79,31 @@ func ProductKey(prefix string, master uint64, idx int) string {
 	return prefix + hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-// GenProducts generates `count` product docs deterministically, starting at
-// the given doc index. The product at index 0 is the anchor doc (only
-// written when startIdx == 0). Caller must pass startIdx == 0 for a
-// fresh preload; non-zero shifts keys so re-running preload with a
-// larger offset appends new docs instead of overwriting the existing.
-func GenProducts(
+// GenProductsStream generates `count` product docs deterministically and
+// emits them one at a time on `out`, closing `out` when done (or when
+// ctx is cancelled). The product at idx == 0 is the anchor doc and only
+// appears when startIdx == 0.
+//
+// Streaming (vs the older slice-returning variant) keeps peak resident
+// memory bounded at the channel buffer size + the consumers' batch
+// buffers, regardless of how many docs are generated — necessary for
+// multi-million-doc preloads that would otherwise materialize an
+// O(count × ~4 KB) slice.
+func GenProductsStream(
+	ctx context.Context,
 	master uint64,
 	prefix string,
 	startIdx, count int,
 	descCentroids, imgCentroids, featCentroids [][]float32,
-) []ProductDoc {
+	out chan<- ProductDoc,
+) {
+	defer close(out)
 	productsRNG := RNG(master, StreamProducts)
 	geoRNG := RNG(master, StreamGeo)
 	descRNG := RNG(master, StreamVectorsDesc)
 	imgRNG := RNG(master, StreamVectorsImg)
 	featRNG := RNG(master, StreamVectorsFeat)
 
-	docs := make([]ProductDoc, count)
 	for i := 0; i < count; i++ {
 		idx := startIdx + i
 		var p Product
@@ -106,9 +114,13 @@ func GenProducts(
 			p = makeProduct(idx, productsRNG, geoRNG, descRNG, imgRNG, featRNG,
 				descCentroids, imgCentroids, featCentroids)
 		}
-		docs[i] = ProductDoc{Key: ProductKey(prefix, master, idx), Product: p, Index: idx}
+		doc := ProductDoc{Key: ProductKey(prefix, master, idx), Product: p, Index: idx}
+		select {
+		case <-ctx.Done():
+			return
+		case out <- doc:
+		}
 	}
-	return docs
 }
 
 type ProductDoc struct {

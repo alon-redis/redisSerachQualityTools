@@ -1,6 +1,7 @@
 package datagen
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -30,13 +31,23 @@ var (
 	devices      = []string{"mobile", "mobile", "desktop", "tablet"}
 )
 
-// GenEvents materializes `count` event docs deterministically, starting at
-// the given doc index. `productCount` is the total number of products the
-// generated events may reference via `product_sku` — typically
-// startIdx + new-products-being-written when growing a dataset.
-func GenEvents(master uint64, prefix string, startIdx, count, productCount int) []EventDoc {
+// GenEventsStream generates `count` event docs deterministically and emits
+// them on `out`, closing `out` when done (or when ctx is cancelled).
+// `productCount` is the total number of products that generated events may
+// reference via `product_sku` (typically startIdx + new-products-being-written
+// when growing a dataset).
+//
+// Streaming variant — kept peak resident memory at O(channel buffer)
+// regardless of `count`. Necessary for multi-million-event preloads.
+func GenEventsStream(
+	ctx context.Context,
+	master uint64,
+	prefix string,
+	startIdx, count, productCount int,
+	out chan<- EventDoc,
+) {
+	defer close(out)
 	rng := RNG(master, StreamEvents)
-	docs := make([]EventDoc, count)
 	for i := 0; i < count; i++ {
 		idx := startIdx + i
 		userID := fmt.Sprintf("u%05d", rng.IntN(10000))
@@ -55,7 +66,7 @@ func GenEvents(master uint64, prefix string, startIdx, count, productCount int) 
 		dwell := int64(math.Exp(7 + 1.0*rng.NormFloat64()))
 		country := countryCodes[zipf(rng, len(countryCodes))]
 		device := devices[rng.IntN(len(devices))]
-		docs[i] = EventDoc{
+		doc := EventDoc{
 			Key: fmt.Sprintf("%s%07d", prefix, idx),
 			Event: Event{
 				UserID:     userID,
@@ -69,8 +80,12 @@ func GenEvents(master uint64, prefix string, startIdx, count, productCount int) 
 				Device:     device,
 			},
 		}
+		select {
+		case <-ctx.Done():
+			return
+		case out <- doc:
+		}
 	}
-	return docs
 }
 
 // FlatHash projects an Event into the (field, value) slice HSET expects.

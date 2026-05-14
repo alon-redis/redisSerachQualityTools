@@ -95,27 +95,36 @@ func Preload(
 	}
 
 	startIdx := cfg.Dataset.StartIndex
-	products := datagen.GenProducts(
+
+	// Stream the product corpus into the writer pool. Channel buffer is
+	// generous enough that the generator doesn't stall under normal
+	// pipeline latency, but capped so peak memory stays at ~tens of MB
+	// regardless of cfg.Dataset.Products. (Previously the whole corpus
+	// was materialized in one []ProductDoc; 50M products × ~4KB blew up
+	// at ~200 GB.)
+	productsCh := make(chan datagen.ProductDoc, preloadPipelineBatch*2)
+	go datagen.GenProductsStream(ctx,
 		cfg.Seed, cfg.Indexes.Product.Prefix,
 		startIdx, cfg.Dataset.Products,
 		corpus.DescCentroids, corpus.ImgCentroids, corpus.FeatCentroids,
-	)
-	if err := writeProductsConcurrent(ctx, rdb, products, log, flex, &productsWritten); err != nil {
+		productsCh)
+	if err := writeProductsConcurrent(ctx, rdb, productsCh, log, flex, &productsWritten); err != nil {
 		return nil, fmt.Errorf("writing products: %w", err)
 	}
-	log.Info("wrote products", "count", len(products), "start_index", startIdx, "flex", flex)
+	log.Info("wrote products", "count", cfg.Dataset.Products, "start_index", startIdx, "flex", flex)
 
 	// Events may reference any SKU in the *current total* product space
 	// (existing + just-written), so pass startIdx+count as the reference range.
-	events := datagen.GenEvents(
+	eventsCh := make(chan datagen.EventDoc, preloadPipelineBatch*2)
+	go datagen.GenEventsStream(ctx,
 		cfg.Seed, cfg.Indexes.Event.Prefix,
 		startIdx, cfg.Dataset.Events,
 		startIdx+cfg.Dataset.Products,
-	)
-	if err := writeEventsConcurrent(ctx, rdb, events, log, &eventsWritten); err != nil {
+		eventsCh)
+	if err := writeEventsConcurrent(ctx, rdb, eventsCh, log, &eventsWritten); err != nil {
 		return nil, fmt.Errorf("writing events: %w", err)
 	}
-	log.Info("wrote events", "count", len(events), "start_index", startIdx)
+	log.Info("wrote events", "count", cfg.Dataset.Events, "start_index", startIdx)
 
 	if err := waitForIndexing(ctx, rdb, cfg.Indexes.Product.Name, 10*time.Minute, log); err != nil {
 		return nil, err
@@ -127,51 +136,60 @@ func Preload(
 	return corpus, nil
 }
 
-func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.ProductDoc, log *slog.Logger, flex bool, written *atomic.Int64) error {
+// writeProductsConcurrent pulls product docs off `in` and pipelines them
+// in batches of preloadPipelineBatch across `workers` writer goroutines.
+// Each worker accumulates docs locally — peak memory per worker is one
+// batch (~500 docs × ~4 KB ≈ 2 MB), so total resident memory for the
+// writer pool stays around 16 MB regardless of how many docs the
+// generator produces.
+func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, in <-chan datagen.ProductDoc, log *slog.Logger, flex bool, written *atomic.Int64) error {
 	const workers = 8
-	jobs := make(chan []datagen.ProductDoc, workers*2)
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
+
+	flushBatch := func(batch []datagen.ProductDoc) {
+		if len(batch) == 0 {
+			return
+		}
+		pipe := rdb.Pipeline()
+		for _, d := range batch {
+			if flex {
+				// Flex requires HASH storage with vectors as raw FP32 bytes.
+				pipe.HSet(ctx, d.Key, d.Product.FlatHashFlex()...)
+				continue
+			}
+			b, err := json.Marshal(d.Product)
+			if err != nil {
+				errs <- err
+				return
+			}
+			pipe.Do(ctx, "JSON.SET", d.Key, "$", b)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			// pipeline-level error; one bad cmd shouldn't fail the rest
+			// but go-redis returns the first error. Log and continue.
+			log.Warn("product pipeline exec returned error", "err", err)
+		}
+		if written != nil {
+			written.Add(int64(len(batch)))
+		}
+	}
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for batch := range jobs {
-				pipe := rdb.Pipeline()
-				for _, d := range batch {
-					if flex {
-						// Flex requires HASH storage with vectors as raw FP32 bytes.
-						pipe.HSet(ctx, d.Key, d.Product.FlatHashFlex()...)
-						continue
-					}
-					b, err := json.Marshal(d.Product)
-					if err != nil {
-						errs <- err
-						return
-					}
-					pipe.Do(ctx, "JSON.SET", d.Key, "$", b)
-				}
-				if _, err := pipe.Exec(ctx); err != nil {
-					// pipeline-level error; one bad cmd shouldn't fail the rest
-					// but go-redis returns the first error. Log and continue.
-					log.Warn("product pipeline exec returned error", "err", err)
-				}
-				if written != nil {
-					written.Add(int64(len(batch)))
+			batch := make([]datagen.ProductDoc, 0, preloadPipelineBatch)
+			for doc := range in {
+				batch = append(batch, doc)
+				if len(batch) >= preloadPipelineBatch {
+					flushBatch(batch)
+					batch = batch[:0]
 				}
 			}
+			flushBatch(batch)
 		}()
 	}
-
-	for i := 0; i < len(docs); i += preloadPipelineBatch {
-		end := i + preloadPipelineBatch
-		if end > len(docs) {
-			end = len(docs)
-		}
-		jobs <- docs[i:end]
-	}
-	close(jobs)
 	wg.Wait()
 	close(errs)
 	for e := range errs {
@@ -182,39 +200,43 @@ func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, doc
 	return nil
 }
 
-func writeEventsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.EventDoc, log *slog.Logger, written *atomic.Int64) error {
+// writeEventsConcurrent — analogous streaming consumer for the event corpus.
+func writeEventsConcurrent(ctx context.Context, rdb redis.UniversalClient, in <-chan datagen.EventDoc, log *slog.Logger, written *atomic.Int64) error {
 	const workers = 8
-	jobs := make(chan []datagen.EventDoc, workers*2)
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
+
+	flushBatch := func(batch []datagen.EventDoc) {
+		if len(batch) == 0 {
+			return
+		}
+		pipe := rdb.Pipeline()
+		for _, d := range batch {
+			pipe.HSet(ctx, d.Key, d.Event.FlatHash()...)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Warn("event pipeline exec returned error", "err", err)
+		}
+		if written != nil {
+			written.Add(int64(len(batch)))
+		}
+	}
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for batch := range jobs {
-				pipe := rdb.Pipeline()
-				for _, d := range batch {
-					pipe.HSet(ctx, d.Key, d.Event.FlatHash()...)
-				}
-				if _, err := pipe.Exec(ctx); err != nil {
-					log.Warn("event pipeline exec returned error", "err", err)
-				}
-				if written != nil {
-					written.Add(int64(len(batch)))
+			batch := make([]datagen.EventDoc, 0, preloadPipelineBatch)
+			for doc := range in {
+				batch = append(batch, doc)
+				if len(batch) >= preloadPipelineBatch {
+					flushBatch(batch)
+					batch = batch[:0]
 				}
 			}
+			flushBatch(batch)
 		}()
 	}
-
-	for i := 0; i < len(docs); i += preloadPipelineBatch {
-		end := i + preloadPipelineBatch
-		if end > len(docs) {
-			end = len(docs)
-		}
-		jobs <- docs[i:end]
-	}
-	close(jobs)
 	wg.Wait()
 	close(errs)
 	for e := range errs {
