@@ -144,9 +144,14 @@ type CoverageConfig struct {
 }
 
 type MetricsConfig struct {
-	OutDir                     string `yaml:"out_dir"`
-	HistogramSignificantDigits int    `yaml:"histogram_significant_digits"`
-	HistogramMaxValueMS        int    `yaml:"histogram_max_value_ms"`
+	OutDir                     string   `yaml:"out_dir"`
+	HistogramSignificantDigits int      `yaml:"histogram_significant_digits"`
+	HistogramMaxValueMS        int      `yaml:"histogram_max_value_ms"`
+	// LiveInterval drives the in-flight stats printer. 0 disables it; a
+	// TTY-attached stderr renders the same table as the end-of-run report
+	// and overwrites it in place each tick; non-TTY stderr emits a one-line
+	// compact summary per tick so log files don't bloat.
+	LiveInterval Duration `yaml:"live_interval"`
 }
 
 type LoggingConfig struct {
@@ -202,6 +207,7 @@ func defaultConfig() *Config {
 			OutDir:                     "./out",
 			HistogramSignificantDigits: 3,
 			HistogramMaxValueMS:        60000,
+			LiveInterval:               Duration(time.Second),
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

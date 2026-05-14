@@ -75,6 +75,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	bgWg.Add(2)
 	go func() { defer bgWg.Done(); r.runInfoPoll(bgCtx) }()
 	go func() { defer bgWg.Done(); r.runAnchorVerify(bgCtx) }()
+	if iv := r.Cfg.Metrics.LiveInterval.D(); iv > 0 {
+		bgWg.Add(1)
+		go func() { defer bgWg.Done(); r.runLiveTicker(bgCtx, iv) }()
+	}
 	defer bgWg.Wait()
 	defer cancelBG()
 

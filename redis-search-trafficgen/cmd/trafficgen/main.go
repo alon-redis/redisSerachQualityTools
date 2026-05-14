@@ -25,12 +25,13 @@ import (
 )
 
 var (
-	flagConfig    string
-	flagRedisAddr string
-	flagSeed      uint64
-	flagOutDir    string
-	flagLogLevel  string
-	flagFlex      bool
+	flagConfig       string
+	flagRedisAddr    string
+	flagSeed         uint64
+	flagOutDir       string
+	flagLogLevel     string
+	flagFlex         bool
+	flagLiveInterval time.Duration
 )
 
 const trafficGenVersion = "0.1.0-mvp"
@@ -46,6 +47,7 @@ func main() {
 	root.PersistentFlags().StringVar(&flagOutDir, "out-dir", "", "override metrics.out_dir")
 	root.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "debug|info|warn|error")
 	root.PersistentFlags().BoolVar(&flagFlex, "flex", false, "force Flex (Search-on-Disk) schema + op set regardless of capability probe (same as redis.flex_mode: force)")
+	root.PersistentFlags().DurationVar(&flagLiveInterval, "live-interval", 0, "override metrics.live_interval (e.g. 1s, 250ms). 0 = use YAML value. To disable live stats, set the YAML to 0 or pass --live-interval=0 if YAML enables it.")
 
 	root.AddCommand(cmdPreload(), cmdRun(), cmdFull(), cmdValidate(), cmdDrop(), cmdCapabilities(), cmdVersion())
 
@@ -70,6 +72,9 @@ func loadCfg() (*config.Config, error) {
 	}
 	if flagOutDir != "" {
 		cfg.Metrics.OutDir = flagOutDir
+	}
+	if flagLiveInterval > 0 {
+		cfg.Metrics.LiveInterval = config.Duration(flagLiveInterval)
 	}
 	return cfg, nil
 }
