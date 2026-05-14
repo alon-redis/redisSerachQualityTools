@@ -145,6 +145,7 @@ func cmdCapabilities() *cobra.Command {
 				return err
 			}
 			caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+			caps.CollapseForFlex()
 			fmt.Printf("Redis %s   Search %s   JSON=%v   Flex=%v   SVS-VAMANA=%v   Hybrid=%v   Hybrid+DIALECT=%v   Dialect3=%v\n",
 				caps.RedisVersion, caps.SearchVersion, caps.HasJSON, caps.IsFlex, caps.SVSVamana,
 				caps.HybridSupported, caps.HybridAcceptsDialect, caps.Dialect3)
@@ -176,7 +177,9 @@ func cmdDrop() *cobra.Command {
 			caps, _ := client.Probe(ctx, rdb)
 			flex := false
 			if caps != nil {
-				flex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+				caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+				caps.CollapseForFlex()
+				flex = caps.IsFlex
 			}
 			if err := schema.DropProduct(ctx, rdb, cfg.Indexes.Product.Name, flex); err != nil {
 				return err
@@ -264,6 +267,7 @@ func doPreload(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 		return err
 	}
 	caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+	caps.CollapseForFlex()
 	log.Info("capabilities probed",
 		"redis", caps.RedisVersion, "search", caps.SearchVersion,
 		"flex", caps.IsFlex, "flex_mode", cfg.Redis.FlexMode,
@@ -288,6 +292,7 @@ func doRun(ctx context.Context, cfg *config.Config, log *slog.Logger, withPreloa
 		return err
 	}
 	caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
+	caps.CollapseForFlex()
 	log.Info("capabilities probed",
 		"redis", caps.RedisVersion, "search", caps.SearchVersion,
 		"flex", caps.IsFlex, "flex_mode", cfg.Redis.FlexMode,

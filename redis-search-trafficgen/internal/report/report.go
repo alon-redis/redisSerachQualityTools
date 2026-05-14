@@ -106,8 +106,9 @@ func Write(outDir string, s Summary) error {
 func RenderText(s Summary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== trafficgen run %s (scenario: %s) ===\n", s.RunID, s.Scenario)
-	fmt.Fprintf(&b, "Duration: %.2fs   Total ops: %d   Errors: %d\n",
-		s.DurationSec, s.Metrics.TotalOps, s.Metrics.TotalErrors)
+	fmt.Fprintf(&b, "Duration: %.2fs   Total ops: %d   Errors: %d   Empty: %d (%.1f%%)\n",
+		s.DurationSec, s.Metrics.TotalOps, s.Metrics.TotalErrors,
+		s.Metrics.TotalZeroResults, 100*s.Metrics.TotalZeroRate)
 	fmt.Fprintf(&b, "Redis: %s   Search: %s   Flex: %v   SVS-VAMANA: %v   Hybrid: %v   Hybrid+DIALECT: %v\n",
 		s.Capabilities.RedisVersion, s.Capabilities.SearchVersion, s.Capabilities.IsFlex,
 		s.Capabilities.SVSVamana, s.Capabilities.HybridSupported, s.Capabilities.HybridAcceptsDialect)

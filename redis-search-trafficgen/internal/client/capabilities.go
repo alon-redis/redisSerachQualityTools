@@ -56,6 +56,20 @@ func ResolveFlex(probed bool, mode string, cliForce bool) bool {
 	}
 }
 
+// CollapseForFlex zeros out capabilities that the Flex code path will
+// never exercise (FT.HYBRID, SVS-VAMANA). Callers MUST run this after
+// ResolveFlex; otherwise force-flex against a non-Flex server leaves
+// caps advertising hybrid + svs even though the runtime registry drops
+// those ops.
+func (c *Capabilities) CollapseForFlex() {
+	if c == nil || !c.IsFlex {
+		return
+	}
+	c.HybridSupported = false
+	c.HybridAcceptsDialect = false
+	c.SVSVamana = false
+}
+
 // Probe runs the full capability discovery sequence.
 func Probe(ctx context.Context, c redis.UniversalClient) (*Capabilities, error) {
 	caps := &Capabilities{}

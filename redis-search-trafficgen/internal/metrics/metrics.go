@@ -32,8 +32,9 @@ type MetricSet struct {
 	significantFigures int
 
 	// Global counters
-	totalOps    uint64
-	totalErrors uint64
+	totalOps          uint64
+	totalErrors       uint64
+	totalZeroResults  uint64 // successful ops that returned an empty result set
 }
 
 type OpMetrics struct {
@@ -98,6 +99,7 @@ func (m *MetricSet) RecordSuccess(op string, lat time.Duration, resultCount int)
 	atomic.AddUint64(&o.queryCount, 1)
 	if resultCount == 0 {
 		atomic.AddUint64(&o.zeroResults, 1)
+		atomic.AddUint64(&m.totalZeroResults, 1)
 	}
 	atomic.AddUint64(&o.totalResults, uint64(resultCount))
 	atomic.AddUint64(&m.totalOps, 1)
@@ -131,9 +133,11 @@ func (m *MetricSet) RecordError(op, errClass string, lat time.Duration) {
 
 // Snapshot returns an immutable report-friendly view, sorted by op name.
 type Snapshot struct {
-	TotalOps    uint64    `json:"total_ops"`
-	TotalErrors uint64    `json:"total_errors"`
-	Ops         []OpStats `json:"ops"`
+	TotalOps         uint64    `json:"total_ops"`
+	TotalErrors      uint64    `json:"total_errors"`
+	TotalZeroResults uint64    `json:"total_zero_results"`
+	TotalZeroRate    float64   `json:"total_zero_rate"`
+	Ops              []OpStats `json:"ops"`
 }
 
 type OpStats struct {
@@ -156,10 +160,18 @@ func (m *MetricSet) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	totalOps := atomic.LoadUint64(&m.totalOps)
+	totalZero := atomic.LoadUint64(&m.totalZeroResults)
+	var totalZeroRate float64
+	if totalOps > 0 {
+		totalZeroRate = float64(totalZero) / float64(totalOps)
+	}
 	out := Snapshot{
-		TotalOps:    atomic.LoadUint64(&m.totalOps),
-		TotalErrors: atomic.LoadUint64(&m.totalErrors),
-		Ops:         make([]OpStats, 0, len(m.ops)),
+		TotalOps:         totalOps,
+		TotalErrors:      atomic.LoadUint64(&m.totalErrors),
+		TotalZeroResults: totalZero,
+		TotalZeroRate:    totalZeroRate,
+		Ops:              make([]OpStats, 0, len(m.ops)),
 	}
 	for name, o := range m.ops {
 		o.mu.Lock()

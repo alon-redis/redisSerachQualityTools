@@ -50,8 +50,10 @@ func (r *Runner) printLiveTTY(startedAt time.Time, lastLines int) int {
 	if s := elapsed.Seconds(); s > 0 {
 		throughput = float64(snap.TotalOps) / s
 	}
-	fmt.Fprintf(&b, "[live %s] Total ops: %d (%.1f/s)   Errors: %d   num_docs: %d   Anchor fails: %d\n",
-		elapsed, snap.TotalOps, throughput, snap.TotalErrors, info.LastNumDocs, info.AnchorFailures)
+	fmt.Fprintf(&b, "[live %s] Total ops: %d (%.1f/s)   Errors: %d   Empty: %d (%.1f%%)   num_docs: %d   Anchor fails: %d\n",
+		elapsed, snap.TotalOps, throughput, snap.TotalErrors,
+		snap.TotalZeroResults, 100*snap.TotalZeroRate,
+		info.LastNumDocs, info.AnchorFailures)
 	fmt.Fprintf(&b, "%-22s %8s %8s %8s %8s %8s %8s %10s\n",
 		"op", "count", "errs", "p50", "p95", "p99", "p99.9", "zero_rate")
 	lines := 2
@@ -76,8 +78,10 @@ func (r *Runner) printLivePlain(startedAt time.Time) {
 		throughput = float64(snap.TotalOps) / s
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[live %s] ops=%d (%.1f/s) errs=%d num_docs=%d anchor_fails=%d",
-		elapsed, snap.TotalOps, throughput, snap.TotalErrors, info.LastNumDocs, info.AnchorFailures)
+	fmt.Fprintf(&b, "[live %s] ops=%d (%.1f/s) errs=%d empty=%d (%.1f%%) num_docs=%d anchor_fails=%d",
+		elapsed, snap.TotalOps, throughput, snap.TotalErrors,
+		snap.TotalZeroResults, 100*snap.TotalZeroRate,
+		info.LastNumDocs, info.AnchorFailures)
 	for _, op := range snap.Ops {
 		fmt.Fprintf(&b, "  %s(c=%d,p50=%.0f,p99=%.0f,zr=%.2f)",
 			op.Op, op.Count, op.P50MS, op.P99MS, op.ZeroRate)
