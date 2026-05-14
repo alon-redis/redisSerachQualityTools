@@ -10,8 +10,18 @@ Target: **Redis 8.6+** with **RediSearch** and **RedisJSON** modules loaded.
 ## Quickstart
 
 ```bash
-# Build
-make build       # → ./bin/trafficgen
+sudo apt-get update -y
+sudo apt-get install -y git make wget
+GO_VER=1.22.6
+wget -q https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go${GO_VER}.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+export PATH=$PATH:/usr/local/go/bin
+go version    # → "go version go1.22.6 linux/amd64"
+git clone https://github.com/alon-redis/redisSerachQualityTools.git
+
+cd redisSerachQualityTools/redis-search-trafficgen
+make build              # → ./bin/trafficgen
 
 # Validate a scenario (no Redis traffic)
 ./bin/trafficgen validate --config scenarios/smoke.yaml
