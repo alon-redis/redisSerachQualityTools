@@ -146,8 +146,8 @@ func cmdCapabilities() *cobra.Command {
 			}
 			caps.IsFlex = client.ResolveFlex(caps.IsFlex, cfg.Redis.FlexMode, flagFlex)
 			caps.CollapseForFlex()
-			fmt.Printf("Redis %s   Search %s   JSON=%v   Flex=%v   SVS-VAMANA=%v   Hybrid=%v   Hybrid+DIALECT=%v   Dialect3=%v\n",
-				caps.RedisVersion, caps.SearchVersion, caps.HasJSON, caps.IsFlex, caps.SVSVamana,
+			fmt.Printf("Redis %s   Search %s   JSON=%v   Cluster=%v   Flex=%v   SVS-VAMANA=%v   Hybrid=%v   Hybrid+DIALECT=%v   Dialect3=%v\n",
+				caps.RedisVersion, caps.SearchVersion, caps.HasJSON, caps.IsCluster, caps.IsFlex, caps.SVSVamana,
 				caps.HybridSupported, caps.HybridAcceptsDialect, caps.Dialect3)
 			return nil
 		},

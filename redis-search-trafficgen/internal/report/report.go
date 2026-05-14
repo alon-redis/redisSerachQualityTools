@@ -109,8 +109,9 @@ func RenderText(s Summary) string {
 	fmt.Fprintf(&b, "Duration: %.2fs   Total ops: %d   Errors: %d   Empty: %d (%.1f%%)\n",
 		s.DurationSec, s.Metrics.TotalOps, s.Metrics.TotalErrors,
 		s.Metrics.TotalZeroResults, 100*s.Metrics.TotalZeroRate)
-	fmt.Fprintf(&b, "Redis: %s   Search: %s   Flex: %v   SVS-VAMANA: %v   Hybrid: %v   Hybrid+DIALECT: %v\n",
-		s.Capabilities.RedisVersion, s.Capabilities.SearchVersion, s.Capabilities.IsFlex,
+	fmt.Fprintf(&b, "Redis: %s   Search: %s   Cluster: %v   Flex: %v   SVS-VAMANA: %v   Hybrid: %v   Hybrid+DIALECT: %v\n",
+		s.Capabilities.RedisVersion, s.Capabilities.SearchVersion,
+		s.Capabilities.IsCluster, s.Capabilities.IsFlex,
 		s.Capabilities.SVSVamana, s.Capabilities.HybridSupported, s.Capabilities.HybridAcceptsDialect)
 
 	fmt.Fprintf(&b, "\n-- Per-op latency (ms) --\n")

@@ -25,6 +25,10 @@ type Capabilities struct {
 	// FT.AGGREGATE, NUMERIC/GEO/GEOSHAPE/FLAT/SVS fields, and FP16
 	// vectors; FT.SEARCH must use NOCONTENT or RETURN 0.
 	IsFlex bool
+	// IsCluster is true when CLUSTER INFO reports cluster_enabled:1.
+	// Reflected in the report header so the user can see at a glance
+	// that the trafficgen is talking to a multi-node cluster.
+	IsCluster bool
 }
 
 const probeIndexSVS = "idx:_probe_svs"
@@ -109,6 +113,7 @@ func Probe(ctx context.Context, c redis.UniversalClient) (*Capabilities, error) 
 	}
 
 	caps.Dialect3 = true // 8.4+ always supports DIALECT 3
+	caps.IsCluster = probeClusterEnabled(ctx, c)
 	caps.IsFlex = probeFlex(ctx, c)
 	if caps.IsFlex {
 		// Flex disables hybrid + aggregate + SVS-VAMANA entirely. Skip the
@@ -122,6 +127,22 @@ func Probe(ctx context.Context, c redis.UniversalClient) (*Capabilities, error) 
 }
 
 const probeIndexFlex = "idx:_probe_flex"
+
+// probeClusterEnabled returns true when CLUSTER INFO reports a multi-shard
+// topology. Shares the heuristic with client.looksLikeCluster (handles the
+// case where Redis Enterprise omits the cluster_enabled:1 line and the
+// only positive signal is cluster_slots_assigned:16384).
+func probeClusterEnabled(ctx context.Context, c redis.UniversalClient) bool {
+	res, err := c.Do(ctx, "CLUSTER", "INFO").Result()
+	if err != nil {
+		return false
+	}
+	s, ok := res.(string)
+	if !ok {
+		return false
+	}
+	return looksLikeCluster(s)
+}
 
 // probeFlex returns true when the connected Redis is a Flex (Search-on-Disk)
 // database. Detection: try creating a trivial JSON-backed index. Flex
