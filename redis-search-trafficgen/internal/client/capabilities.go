@@ -149,7 +149,7 @@ func probeClusterEnabled(ctx context.Context, c redis.UniversalClient) bool {
 // rejects with `SEARCH_FLEX_UNSUPPORTED_FT_CREATE_ARGUMENT` ("Only HASH is
 // supported as index data type for Flex indexes").
 func probeFlex(ctx context.Context, c redis.UniversalClient) bool {
-	_, _ = c.Do(ctx, "FT.DROPINDEX", probeIndexFlex, "DD").Result()
+	dropProbeIndex(ctx, c, probeIndexFlex)
 	args := []interface{}{
 		"FT.CREATE", probeIndexFlex,
 		"ON", "JSON", "PREFIX", "1", "_probe_flex:",
@@ -158,7 +158,7 @@ func probeFlex(ctx context.Context, c redis.UniversalClient) bool {
 	}
 	_, err := c.Do(ctx, args...).Result()
 	if err == nil {
-		_, _ = c.Do(ctx, "FT.DROPINDEX", probeIndexFlex, "DD").Result()
+		dropProbeIndex(ctx, c, probeIndexFlex)
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -246,7 +246,7 @@ func probeSVS(ctx context.Context, c redis.UniversalClient) bool {
 	// Try creating an SVS-VAMANA index against an arbitrary prefix. If the
 	// engine rejects the vector type we get an error and the capability is
 	// false. Always drop the probe index afterward.
-	_, _ = c.Do(ctx, "FT.DROPINDEX", probeIndexSVS, "DD").Result()
+	dropProbeIndex(ctx, c, probeIndexSVS)
 	args := []interface{}{
 		"FT.CREATE", probeIndexSVS,
 		"ON", "JSON", "PREFIX", "1", "_probe_svs:",
@@ -258,24 +258,17 @@ func probeSVS(ctx context.Context, c redis.UniversalClient) bool {
 	if err != nil {
 		return false
 	}
-	_, _ = c.Do(ctx, "FT.DROPINDEX", probeIndexSVS, "DD").Result()
+	dropProbeIndex(ctx, c, probeIndexSVS)
 	return true
 }
 
 func probeHybrid(ctx context.Context, c redis.UniversalClient) (supported, acceptsDialect bool) {
-	_, _ = c.Do(ctx, "FT.DROPINDEX", probeIndexHybrid, "DD").Result()
-	createArgs := []interface{}{
-		"FT.CREATE", probeIndexHybrid,
-		"ON", "HASH", "PREFIX", "1", "_probe_hybrid:",
-		"SCHEMA",
-		"title", "TEXT",
-		"v", "VECTOR", "HNSW", "6",
-		"TYPE", "FLOAT32", "DIM", "4", "DISTANCE_METRIC", "COSINE",
-	}
-	if _, err := c.Do(ctx, createArgs...).Result(); err != nil {
+	dropProbeIndex(ctx, c, probeIndexHybrid)
+
+	if err := createProbeHybridIndex(ctx, c); err != nil {
 		return false, false
 	}
-	defer c.Do(ctx, "FT.DROPINDEX", probeIndexHybrid, "DD")
+	defer dropProbeIndex(ctx, c, probeIndexHybrid)
 
 	qv := []byte{0, 0, 0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0} // [1,0,0,0] LE FP32
 
@@ -303,4 +296,65 @@ func probeHybrid(ctx context.Context, c redis.UniversalClient) (supported, accep
 		acceptsDialect = true
 	}
 	return supported, acceptsDialect
+}
+
+// createProbeHybridIndex tries the cheap in-memory HNSW schema first; on
+// the Flex/Search-on-Disk "Disk HNSW index requires X parameter" family of
+// errors it falls back to a full Disk-compatible schema
+// (SKIPINITIALSCAN + M + EF_CONSTRUCTION + EF_RUNTIME + RERANK TRUE).
+// Either path leaves the probe index ready for the FT.HYBRID test.
+func createProbeHybridIndex(ctx context.Context, c redis.UniversalClient) error {
+	simple := []interface{}{
+		"FT.CREATE", probeIndexHybrid,
+		"ON", "HASH", "PREFIX", "1", "_probe_hybrid:",
+		"SCHEMA",
+		"title", "TEXT",
+		"v", "VECTOR", "HNSW", "10",
+		"TYPE", "FLOAT32", "DIM", "4", "DISTANCE_METRIC", "COSINE",
+		"M", "16", "EF_CONSTRUCTION", "200",
+	}
+	_, err := c.Do(ctx, simple...).Result()
+	if err == nil {
+		return nil
+	}
+	if !looksLikeDiskHNSWRequired(err) {
+		return err
+	}
+	disk := []interface{}{
+		"FT.CREATE", probeIndexHybrid,
+		"ON", "HASH", "PREFIX", "1", "_probe_hybrid:",
+		"SKIPINITIALSCAN",
+		"SCHEMA",
+		"title", "TEXT",
+		"v", "VECTOR", "HNSW", "14",
+		"TYPE", "FLOAT32", "DIM", "4", "DISTANCE_METRIC", "COSINE",
+		"M", "16", "EF_CONSTRUCTION", "200", "EF_RUNTIME", "10", "RERANK", "TRUE",
+	}
+	if _, err2 := c.Do(ctx, disk...).Result(); err2 != nil {
+		return err2
+	}
+	return nil
+}
+
+// looksLikeDiskHNSWRequired matches the Flex/Disk family of errors that
+// fire when an HNSW field is missing a required Disk parameter (M /
+// EF_CONSTRUCTION / EF_RUNTIME / RERANK). Used to decide whether to retry
+// FT.CREATE with the full Disk-compatible schema.
+func looksLikeDiskHNSWRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "disk hnsw") && strings.Contains(s, "requires")
+}
+
+// dropProbeIndex removes a probe index regardless of whether the backend
+// is Flex (which rejects the DD keyword) or in-memory (which accepts it).
+// All errors are ignored — the caller doesn't care, only the next probe
+// attempt does.
+func dropProbeIndex(ctx context.Context, c redis.UniversalClient, name string) {
+	if _, err := c.Do(ctx, "FT.DROPINDEX", name, "DD").Result(); err == nil {
+		return
+	}
+	_, _ = c.Do(ctx, "FT.DROPINDEX", name).Result()
 }
