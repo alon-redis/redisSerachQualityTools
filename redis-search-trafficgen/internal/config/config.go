@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -45,12 +47,41 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&s); err != nil {
 		return err
 	}
-	td, err := time.ParseDuration(s)
+	expanded := expandLargeDurationUnits(s)
+	td, err := time.ParseDuration(expanded)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
 	}
 	*d = Duration(td)
 	return nil
+}
+
+// largeUnitRE matches a number followed by `d` (days) or `w` (weeks), which
+// time.ParseDuration doesn't recognise natively. The expansion converts each
+// match to its equivalent in hours so the rest of the string (e.g.
+// "3d12h" → "84h") goes through stdlib parsing unchanged.
+//
+// Practical max: time.Duration is int64 nanoseconds ≈ 292 years. The
+// parser will surface "invalid duration" for anything past that — but
+// you should never write a phase that long anyway.
+var largeUnitRE = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)([dw])`)
+
+func expandLargeDurationUnits(s string) string {
+	return largeUnitRE.ReplaceAllStringFunc(s, func(m string) string {
+		parts := largeUnitRE.FindStringSubmatch(m)
+		if len(parts) != 3 {
+			return m
+		}
+		n, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return m
+		}
+		hours := n * 24
+		if parts[2] == "w" {
+			hours *= 7
+		}
+		return fmt.Sprintf("%fh", hours)
+	})
 }
 
 type RedisConfig struct {
