@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -78,17 +81,30 @@ func Preload(
 		return nil, err
 	}
 
+	// Progress counters consumed by the (optional) preload progress ticker.
+	// Heavy preloads (250k products w/ vectors) take minutes against a
+	// cross-region endpoint; without these the user sees nothing between
+	// "capabilities probed" and "wrote products".
+	var productsWritten, eventsWritten atomic.Int64
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	defer cancelProgress()
+	if iv := cfg.Metrics.LiveInterval.D(); iv > 0 {
+		go preloadProgressTicker(progressCtx, iv,
+			&productsWritten, int64(cfg.Dataset.Products),
+			&eventsWritten, int64(cfg.Dataset.Events))
+	}
+
 	products := datagen.GenProducts(
 		cfg.Seed, cfg.Indexes.Product.Prefix, cfg.Dataset.Products,
 		corpus.DescCentroids, corpus.ImgCentroids, corpus.FeatCentroids,
 	)
-	if err := writeProductsConcurrent(ctx, rdb, products, log, flex); err != nil {
+	if err := writeProductsConcurrent(ctx, rdb, products, log, flex, &productsWritten); err != nil {
 		return nil, fmt.Errorf("writing products: %w", err)
 	}
 	log.Info("wrote products", "count", len(products), "flex", flex)
 
 	events := datagen.GenEvents(cfg.Seed, cfg.Indexes.Event.Prefix, cfg.Dataset.Events, cfg.Dataset.Products)
-	if err := writeEventsConcurrent(ctx, rdb, events, log); err != nil {
+	if err := writeEventsConcurrent(ctx, rdb, events, log, &eventsWritten); err != nil {
 		return nil, fmt.Errorf("writing events: %w", err)
 	}
 	log.Info("wrote events", "count", len(events))
@@ -103,7 +119,7 @@ func Preload(
 	return corpus, nil
 }
 
-func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.ProductDoc, log *slog.Logger, flex bool) error {
+func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.ProductDoc, log *slog.Logger, flex bool, written *atomic.Int64) error {
 	const workers = 8
 	jobs := make(chan []datagen.ProductDoc, workers*2)
 	errs := make(chan error, workers)
@@ -133,6 +149,9 @@ func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, doc
 					// but go-redis returns the first error. Log and continue.
 					log.Warn("product pipeline exec returned error", "err", err)
 				}
+				if written != nil {
+					written.Add(int64(len(batch)))
+				}
 			}
 		}()
 	}
@@ -155,7 +174,7 @@ func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, doc
 	return nil
 }
 
-func writeEventsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.EventDoc, log *slog.Logger) error {
+func writeEventsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs []datagen.EventDoc, log *slog.Logger, written *atomic.Int64) error {
 	const workers = 8
 	jobs := make(chan []datagen.EventDoc, workers*2)
 	errs := make(chan error, workers)
@@ -172,6 +191,9 @@ func writeEventsConcurrent(ctx context.Context, rdb redis.UniversalClient, docs 
 				}
 				if _, err := pipe.Exec(ctx); err != nil {
 					log.Warn("event pipeline exec returned error", "err", err)
+				}
+				if written != nil {
+					written.Add(int64(len(batch)))
 				}
 			}
 		}()
@@ -260,4 +282,46 @@ func asInt(v interface{}) int {
 		return n
 	}
 	return 0
+}
+
+// preloadProgressTicker prints products / events written every `iv` on
+// stderr. Runs only while ctx is alive; the Preload caller cancels its
+// context once both write phases complete. Uses ANSI cursor-up to
+// overwrite the previous tick when stderr is a TTY; otherwise scrolls.
+func preloadProgressTicker(ctx context.Context, iv time.Duration,
+	productsWritten *atomic.Int64, productsTotal int64,
+	eventsWritten *atomic.Int64, eventsTotal int64) {
+	isTTY := stderrIsTTY()
+	startedAt := time.Now()
+	t := time.NewTicker(iv)
+	defer t.Stop()
+
+	var lastLines int32
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p := productsWritten.Load()
+			e := eventsWritten.Load()
+			elapsed := time.Since(startedAt).Round(time.Second)
+
+			pp, ep := 0.0, 0.0
+			if productsTotal > 0 {
+				pp = 100 * float64(p) / float64(productsTotal)
+			}
+			if eventsTotal > 0 {
+				ep = 100 * float64(e) / float64(eventsTotal)
+			}
+
+			var b strings.Builder
+			if isTTY && atomic.LoadInt32(&lastLines) > 0 {
+				fmt.Fprintf(&b, "\x1b[%dA\x1b[J", atomic.LoadInt32(&lastLines))
+			}
+			fmt.Fprintf(&b, "[preload %s] products: %d/%d (%.1f%%)   events: %d/%d (%.1f%%)\n",
+				elapsed, p, productsTotal, pp, e, eventsTotal, ep)
+			_, _ = os.Stderr.WriteString(b.String())
+			atomic.StoreInt32(&lastLines, 1)
+		}
+	}
 }
