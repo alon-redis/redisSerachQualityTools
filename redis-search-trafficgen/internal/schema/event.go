@@ -32,6 +32,9 @@ func CreateEvent(ctx context.Context, rdb redis.UniversalClient, o EventIndexOpt
 		"device", "TAG",
 	}
 	if _, err := rdb.Do(ctx, args...).Result(); err != nil {
+		if isIndexExists(err) {
+			return nil
+		}
 		return fmt.Errorf("FT.CREATE %s: %w", o.Name, err)
 	}
 	return nil
@@ -55,6 +58,9 @@ func createEventFlex(ctx context.Context, rdb redis.UniversalClient, o EventInde
 		"device", "TAG",
 	}
 	if _, err := rdb.Do(ctx, args...).Result(); err != nil {
+		if isIndexExists(err) {
+			return nil
+		}
 		return fmt.Errorf("FT.CREATE %s (flex): %w", o.Name, err)
 	}
 	return nil

@@ -97,6 +97,12 @@ type DatasetConfig struct {
 	Preload     bool `yaml:"preload"`
 	DropIndexes bool `yaml:"drop_indexes"`
 	FlushDB     bool `yaml:"flush_db"`
+	// StartIndex shifts the per-doc index used to derive keys + values so
+	// repeated preloads add new docs instead of overwriting the existing
+	// ones. Set to N when extending an N-doc dataset by another `products`
+	// worth. The companion FT.CREATE call is made tolerant of
+	// "index already exists" errors so re-running the preload is safe.
+	StartIndex int `yaml:"start_index"`
 }
 
 type IndexesConfig struct {
@@ -250,6 +256,9 @@ func Validate(c *Config) error {
 	}
 	if c.Dataset.Products < c.Vectors.Clusters*2 {
 		return fmt.Errorf("dataset.products (%d) must be >= 2 * vectors.clusters (%d)", c.Dataset.Products, c.Vectors.Clusters)
+	}
+	if c.Dataset.StartIndex < 0 {
+		return fmt.Errorf("dataset.start_index must be >= 0 (got %d)", c.Dataset.StartIndex)
 	}
 	switch c.Redis.FlexMode {
 	case "", "auto", "force", "disable":

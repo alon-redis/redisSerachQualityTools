@@ -30,11 +30,15 @@ var (
 	devices      = []string{"mobile", "mobile", "desktop", "tablet"}
 )
 
-// GenEvents materializes the entire event corpus deterministically.
-func GenEvents(master uint64, prefix string, count, productCount int) []EventDoc {
+// GenEvents materializes `count` event docs deterministically, starting at
+// the given doc index. `productCount` is the total number of products the
+// generated events may reference via `product_sku` — typically
+// startIdx + new-products-being-written when growing a dataset.
+func GenEvents(master uint64, prefix string, startIdx, count, productCount int) []EventDoc {
 	rng := RNG(master, StreamEvents)
 	docs := make([]EventDoc, count)
 	for i := 0; i < count; i++ {
+		idx := startIdx + i
 		userID := fmt.Sprintf("u%05d", rng.IntN(10000))
 		sessionID := fmt.Sprintf("s%07d", rng.IntN(1000000))
 		productIdx := rng.IntN(productCount)
@@ -52,7 +56,7 @@ func GenEvents(master uint64, prefix string, count, productCount int) []EventDoc
 		country := countryCodes[zipf(rng, len(countryCodes))]
 		device := devices[rng.IntN(len(devices))]
 		docs[i] = EventDoc{
-			Key: fmt.Sprintf("%s%07d", prefix, i),
+			Key: fmt.Sprintf("%s%07d", prefix, idx),
 			Event: Event{
 				UserID:     userID,
 				SessionID:  sessionID,

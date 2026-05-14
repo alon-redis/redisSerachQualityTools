@@ -78,12 +78,15 @@ func ProductKey(prefix string, master uint64, idx int) string {
 	return prefix + hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-// GenProducts generates the entire product corpus deterministically and yields
-// (key, product) pairs in order. The product at index 0 is the anchor doc.
+// GenProducts generates `count` product docs deterministically, starting at
+// the given doc index. The product at index 0 is the anchor doc (only
+// written when startIdx == 0). Caller must pass startIdx == 0 for a
+// fresh preload; non-zero shifts keys so re-running preload with a
+// larger offset appends new docs instead of overwriting the existing.
 func GenProducts(
 	master uint64,
 	prefix string,
-	count int,
+	startIdx, count int,
 	descCentroids, imgCentroids, featCentroids [][]float32,
 ) []ProductDoc {
 	productsRNG := RNG(master, StreamProducts)
@@ -94,15 +97,16 @@ func GenProducts(
 
 	docs := make([]ProductDoc, count)
 	for i := 0; i < count; i++ {
+		idx := startIdx + i
 		var p Product
-		if i == 0 {
+		if idx == 0 {
 			p = makeAnchorProduct(productsRNG, geoRNG, descRNG, imgRNG, featRNG,
 				descCentroids, imgCentroids, featCentroids)
 		} else {
-			p = makeProduct(i, productsRNG, geoRNG, descRNG, imgRNG, featRNG,
+			p = makeProduct(idx, productsRNG, geoRNG, descRNG, imgRNG, featRNG,
 				descCentroids, imgCentroids, featCentroids)
 		}
-		docs[i] = ProductDoc{Key: ProductKey(prefix, master, i), Product: p, Index: i}
+		docs[i] = ProductDoc{Key: ProductKey(prefix, master, idx), Product: p, Index: idx}
 	}
 	return docs
 }

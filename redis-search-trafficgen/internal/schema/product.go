@@ -83,6 +83,12 @@ func CreateProduct(ctx context.Context, rdb redis.UniversalClient, o ProductInde
 			o.UseSVS = false
 			return CreateProduct(ctx, rdb, o)
 		}
+		// An already-existing index is fine when extending a dataset via
+		// dataset.start_index > 0; surface as a no-op so re-running preload
+		// against a populated DB doesn't abort.
+		if isIndexExists(err) {
+			return nil
+		}
 		return fmt.Errorf("FT.CREATE %s: %w", o.Name, err)
 	}
 	return nil
@@ -126,9 +132,25 @@ func createProductFlex(ctx context.Context, rdb redis.UniversalClient, o Product
 		"M", "16", "EF_CONSTRUCTION", "200", "EF_RUNTIME", "10", "RERANK", "TRUE",
 	}
 	if _, err := rdb.Do(ctx, args...).Result(); err != nil {
+		if isIndexExists(err) {
+			return nil
+		}
 		return fmt.Errorf("FT.CREATE %s (flex): %w", o.Name, err)
 	}
 	return nil
+}
+
+// isIndexExists matches RediSearch's "an existing index with the same name"
+// error, which fires when FT.CREATE targets a name already in use. Used to
+// make the preload re-runnable against a populated DB (via start_index).
+func isIndexExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "index already exists") ||
+		strings.Contains(s, "name already exists") ||
+		strings.Contains(s, "already exist")
 }
 
 // DropProduct removes the product index. Returns nil if the index didn't

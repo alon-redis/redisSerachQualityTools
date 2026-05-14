@@ -94,20 +94,28 @@ func Preload(
 			&eventsWritten, int64(cfg.Dataset.Events))
 	}
 
+	startIdx := cfg.Dataset.StartIndex
 	products := datagen.GenProducts(
-		cfg.Seed, cfg.Indexes.Product.Prefix, cfg.Dataset.Products,
+		cfg.Seed, cfg.Indexes.Product.Prefix,
+		startIdx, cfg.Dataset.Products,
 		corpus.DescCentroids, corpus.ImgCentroids, corpus.FeatCentroids,
 	)
 	if err := writeProductsConcurrent(ctx, rdb, products, log, flex, &productsWritten); err != nil {
 		return nil, fmt.Errorf("writing products: %w", err)
 	}
-	log.Info("wrote products", "count", len(products), "flex", flex)
+	log.Info("wrote products", "count", len(products), "start_index", startIdx, "flex", flex)
 
-	events := datagen.GenEvents(cfg.Seed, cfg.Indexes.Event.Prefix, cfg.Dataset.Events, cfg.Dataset.Products)
+	// Events may reference any SKU in the *current total* product space
+	// (existing + just-written), so pass startIdx+count as the reference range.
+	events := datagen.GenEvents(
+		cfg.Seed, cfg.Indexes.Event.Prefix,
+		startIdx, cfg.Dataset.Events,
+		startIdx+cfg.Dataset.Products,
+	)
 	if err := writeEventsConcurrent(ctx, rdb, events, log, &eventsWritten); err != nil {
 		return nil, fmt.Errorf("writing events: %w", err)
 	}
-	log.Info("wrote events", "count", len(events))
+	log.Info("wrote events", "count", len(events), "start_index", startIdx)
 
 	if err := waitForIndexing(ctx, rdb, cfg.Indexes.Product.Name, 10*time.Minute, log); err != nil {
 		return nil, err

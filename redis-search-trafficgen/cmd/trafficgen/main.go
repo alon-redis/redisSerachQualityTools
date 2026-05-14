@@ -35,6 +35,7 @@ var (
 	flagLiveInterval time.Duration
 	flagDebugMode    bool
 	flagDebugFile    string
+	flagStartIndex   int
 )
 
 const trafficGenVersion = "0.1.0-mvp"
@@ -53,6 +54,7 @@ func main() {
 	root.PersistentFlags().DurationVar(&flagLiveInterval, "live-interval", 0, "override metrics.live_interval (e.g. 1s, 250ms). 0 = use YAML value. To disable live stats, set the YAML to 0 or pass --live-interval=0 if YAML enables it.")
 	root.PersistentFlags().BoolVar(&flagDebugMode, "debug-mode", false, "capture the last 25 errored requests + the 25 slowest requests, write to --debug-file at end of run")
 	root.PersistentFlags().StringVar(&flagDebugFile, "debug-file", "/tmp/debug.txt", "where --debug-mode writes its capture")
+	root.PersistentFlags().IntVar(&flagStartIndex, "start-index", -1, "override dataset.start_index (-1 = use YAML). Shifts the per-doc index used to derive keys, so re-running preload with a larger offset adds new docs instead of overwriting.")
 
 	root.AddCommand(cmdPreload(), cmdRun(), cmdFull(), cmdValidate(), cmdDrop(), cmdCapabilities(), cmdVersion())
 
@@ -80,6 +82,9 @@ func loadCfg() (*config.Config, error) {
 	}
 	if flagLiveInterval > 0 {
 		cfg.Metrics.LiveInterval = config.Duration(flagLiveInterval)
+	}
+	if flagStartIndex >= 0 {
+		cfg.Dataset.StartIndex = flagStartIndex
 	}
 	return cfg, nil
 }
