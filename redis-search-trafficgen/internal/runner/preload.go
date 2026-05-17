@@ -36,12 +36,19 @@ func BuildCorpus(cfg *config.Config) *datagen.Corpus {
 // Preload drops the indexes (if requested), creates them honoring caps, then
 // writes the deterministic product + event corpora. Returns the same Corpus
 // the runtime phases will use, so call sites don't have to re-derive it.
+//
+// debug2 (set by --debug2) gates a per-1000-product-writes probe of
+// FT.SEARCH <product-index> "*" LIMIT 0 10 NOCONTENT. On a zero-key
+// response it dumps DBSIZE + FT.INFO to /tmp/debug.txt and os.Exit(1)s —
+// the "halt" contract of the flag — so the operator can inspect cluster
+// state at the failure point. Off by default; no probe traffic otherwise.
 func Preload(
 	ctx context.Context,
 	rdb redis.UniversalClient,
 	cfg *config.Config,
 	caps *client.Capabilities,
 	log *slog.Logger,
+	debug2 bool,
 ) (*datagen.Corpus, error) {
 	if cfg.Dataset.FlushDB {
 		log.Warn("flushing entire Redis DB — set dataset.flush_db: false in shared environments")
@@ -108,7 +115,7 @@ func Preload(
 		startIdx, cfg.Dataset.Products,
 		corpus.DescCentroids, corpus.ImgCentroids, corpus.FeatCentroids,
 		productsCh)
-	if err := writeProductsConcurrent(ctx, rdb, productsCh, log, flex, &productsWritten); err != nil {
+	if err := writeProductsConcurrent(ctx, rdb, productsCh, log, flex, &productsWritten, debug2, cfg.Indexes.Product.Name); err != nil {
 		return nil, fmt.Errorf("writing products: %w", err)
 	}
 	log.Info("wrote products", "count", cfg.Dataset.Products, "start_index", startIdx, "flex", flex)
@@ -142,8 +149,16 @@ func Preload(
 // batch (~500 docs × ~4 KB ≈ 2 MB), so total resident memory for the
 // writer pool stays around 16 MB regardless of how many docs the
 // generator produces.
-func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, in <-chan datagen.ProductDoc, log *slog.Logger, flex bool, written *atomic.Int64) error {
+//
+// When debug2 is true, after each batch's atomic counter bump we check
+// whether the cumulative write count crossed a multiple of 1000; if so we
+// fire one FT.SEARCH probe (delegated to runDebug2ProductProbe) — exactly
+// one worker observes the crossing per 1000-multiple, so probe frequency
+// is bounded at 1 per 1000 docs regardless of how many writers are
+// active.
+func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, in <-chan datagen.ProductDoc, log *slog.Logger, flex bool, written *atomic.Int64, debug2 bool, productIndexName string) error {
 	const workers = 8
+	const debug2Every = 1000
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -170,8 +185,19 @@ func writeProductsConcurrent(ctx context.Context, rdb redis.UniversalClient, in 
 			// but go-redis returns the first error. Log and continue.
 			log.Warn("product pipeline exec returned error", "err", err)
 		}
-		if written != nil {
-			written.Add(int64(len(batch)))
+		if written == nil {
+			return
+		}
+		newW := written.Add(int64(len(batch)))
+		if !debug2 {
+			return
+		}
+		prev := newW - int64(len(batch))
+		// Trigger once per 1000-multiple crossed by this batch. Atomic.Add
+		// serializes writers, so each crossing is observed by exactly one
+		// goroutine — no need for a separate mutex around the probe call.
+		if prev/debug2Every != newW/debug2Every {
+			runDebug2ProductProbe(ctx, rdb, productIndexName, newW, log)
 		}
 	}
 
@@ -312,6 +338,106 @@ func asInt(v interface{}) int {
 		return n
 	}
 	return 0
+}
+
+// runDebug2ProductProbe runs FT.SEARCH <index> "*" LIMIT 0 10 NOCONTENT
+// (the contract of --debug2). If at least one key comes back, returns
+// silently. Otherwise it captures DBSIZE + FT.INFO into /tmp/debug.txt
+// and halts the process with os.Exit(1) so the operator can inspect the
+// failure point — the explicit "halt script" requirement of the flag.
+//
+// We swallow the probe's own errors (network blip, transient timeout)
+// because halting on those would mask the real signal — the probe's job
+// is to catch *empty* index state, not to be a health check.
+func runDebug2ProductProbe(ctx context.Context, rdb redis.UniversalClient, indexName string, writesSoFar int64, log *slog.Logger) {
+	res, err := rdb.Do(ctx, "FT.SEARCH", indexName, "*", "LIMIT", 0, 10, "NOCONTENT").Result()
+	if err != nil {
+		log.Warn("debug2: FT.SEARCH probe errored — skipping this tick", "err", err, "writes_so_far", writesSoFar)
+		return
+	}
+	if ftSearchHasAtLeastOneKey(res) {
+		return
+	}
+	log.Error("debug2: FT.SEARCH returned 0 keys — dumping DBSIZE + FT.INFO to /tmp/debug.txt and halting",
+		"index", indexName, "writes_so_far", writesSoFar)
+
+	// Detached short ctx for the diagnostic dump so a cancelled parent
+	// doesn't prevent it. 5 s is enough for both calls on any healthy cluster.
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dcancel()
+	dbsize, dbErr := rdb.Do(dctx, "DBSIZE").Result()
+	info, infoErr := rdb.Do(dctx, "FT.INFO", indexName).Result()
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "=== debug2 halt ===\n")
+	fmt.Fprintf(&sb, "time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&sb, "index: %s\n", indexName)
+	fmt.Fprintf(&sb, "writes_so_far: %d\n", writesSoFar)
+	fmt.Fprintf(&sb, "probe: FT.SEARCH %s \"*\" LIMIT 0 10 NOCONTENT\n", indexName)
+	fmt.Fprintf(&sb, "probe_result: %+v\n\n", res)
+	fmt.Fprintf(&sb, "--- DBSIZE ---\n")
+	if dbErr != nil {
+		fmt.Fprintf(&sb, "ERROR: %v\n", dbErr)
+	} else {
+		fmt.Fprintf(&sb, "%v\n", dbsize)
+	}
+	fmt.Fprintf(&sb, "\n--- FT.INFO %s ---\n", indexName)
+	if infoErr != nil {
+		fmt.Fprintf(&sb, "ERROR: %v\n", infoErr)
+	} else {
+		fmt.Fprintf(&sb, "%+v\n", info)
+	}
+
+	if err := os.WriteFile("/tmp/debug.txt", []byte(sb.String()), 0o644); err != nil {
+		log.Error("debug2: writing /tmp/debug.txt failed", "err", err)
+	}
+	os.Exit(1)
+}
+
+// ftSearchHasAtLeastOneKey accepts both RESP2 (flat []interface{} starting
+// with the count) and RESP3 (map with total_results / results) shapes of
+// an FT.SEARCH ... NOCONTENT response. Returns true if the index reported
+// any hits.
+func ftSearchHasAtLeastOneKey(res interface{}) bool {
+	switch v := res.(type) {
+	case []interface{}:
+		// RESP2 NOCONTENT shape: [count, key1, key2, ...]
+		if len(v) >= 2 {
+			return true
+		}
+		if len(v) == 1 {
+			return asInt(v[0]) > 0
+		}
+		return false
+	case map[interface{}]interface{}:
+		for k, val := range v {
+			s, ok := k.(string)
+			if !ok {
+				continue
+			}
+			if (s == "total_results" || s == "total") && asInt(val) > 0 {
+				return true
+			}
+			if s == "results" {
+				if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	case map[string]interface{}:
+		if val, ok := v["total_results"]; ok && asInt(val) > 0 {
+			return true
+		}
+		if val, ok := v["total"]; ok && asInt(val) > 0 {
+			return true
+		}
+		if arr, ok := v["results"].([]interface{}); ok && len(arr) > 0 {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // preloadProgressTicker prints products / events written every `iv` on
