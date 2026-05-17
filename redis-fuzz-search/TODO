@@ -1,0 +1,18 @@
+- container/subcommand commands
+- quarantine external effects of redis like file saving and stuff to not corrupt system
+- collect statistics on exec time per command to blacklist some pathologically slow ones, when fully incorporates with fuzzer timeout should prune these but not there yet
+- collect statisics on how slowdowns accumulate and add rules for flushin/rolling back to fork (forkinprocessexecutor)
+- automated verification on a good uninstrumented redis-server, can probably only do this once we get like semantically isolated command blocks
+- good way to quickly repro crash sequences
+
+- figure out what i'm mishandling in the harness that causes SLAVEOF/REPLICAOF commands to cause 10s of crashes/s if not blacklisted
+
+- remove many syscalls
+	at end of 
+	src/redis/src/server.h
+	add
+	#undef serverlog
+	#define serverlog(level, ...) 1
+
+- sed -i 's/::template write_element_idx/::write_element_idx/g' \
+/home/enzo/src/redis-fuzz/src/redisearch/bin/linux-x64-release/search-community/_deps/boost-src/boost/qvm/quat_traits.hpp

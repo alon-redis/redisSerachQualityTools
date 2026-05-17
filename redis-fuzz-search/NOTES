@@ -1,0 +1,5 @@
+(mostly log of realizing things that break when you call command functions directly and have to specially account for)
+
+- some commands an realloc argv by rewriteClientCommandArgument so can't use fixed allocation
+- redactClientCommandArgument
+	means we have to reset original_argv/argc

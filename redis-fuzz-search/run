@@ -1,0 +1,9 @@
+#!/bin/sh
+n=${1:-1}
+trap "kill 0 2>/dev/null" INT TERM
+i=0
+while [ "$i" -lt "$n" ]; do
+  ASAN_OPTIONS="detect_odr_violation=0:detect_leaks=0:log_path=asan_log" ./fuzz &
+  i=$((i+1))
+done
+wait
