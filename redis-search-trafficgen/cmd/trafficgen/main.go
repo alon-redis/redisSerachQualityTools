@@ -36,6 +36,7 @@ var (
 	flagDebugMode    bool
 	flagDebugFile    string
 	flagStartIndex   int
+	flagDebug2       bool
 )
 
 const trafficGenVersion = "0.1.0-mvp"
@@ -55,6 +56,7 @@ func main() {
 	root.PersistentFlags().BoolVar(&flagDebugMode, "debug-mode", false, "capture the last 25 errored requests + the 25 slowest requests, write to --debug-file at end of run")
 	root.PersistentFlags().StringVar(&flagDebugFile, "debug-file", "/tmp/debug.txt", "where --debug-mode writes its capture")
 	root.PersistentFlags().IntVar(&flagStartIndex, "start-index", -1, "override dataset.start_index (-1 = use YAML). Shifts the per-doc index used to derive keys, so re-running preload with a larger offset adds new docs instead of overwriting.")
+	root.PersistentFlags().BoolVar(&flagDebug2, "debug2", false, "during preload, run FT.SEARCH <product-index> \"*\" LIMIT 0 10 NOCONTENT every 1000 product writes; on a zero-key response, dump DBSIZE + FT.INFO to /tmp/debug.txt and halt the process")
 
 	root.AddCommand(cmdPreload(), cmdRun(), cmdFull(), cmdValidate(), cmdDrop(), cmdCapabilities(), cmdVersion())
 
@@ -283,7 +285,7 @@ func doPreload(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 		"flex", caps.IsFlex, "flex_mode", cfg.Redis.FlexMode,
 		"svs_vamana", caps.SVSVamana, "hybrid", caps.HybridSupported,
 		"hybrid_dialect", caps.HybridAcceptsDialect)
-	if _, err := runner.Preload(ctx, rdb, cfg, caps, log); err != nil {
+	if _, err := runner.Preload(ctx, rdb, cfg, caps, log, flagDebug2); err != nil {
 		return err
 	}
 	log.Info("preload complete")
@@ -311,7 +313,7 @@ func doRun(ctx context.Context, cfg *config.Config, log *slog.Logger, withPreloa
 
 	var corpus *datagen.Corpus
 	if withPreload {
-		corpus, err = runner.Preload(ctx, rdb, cfg, caps, log)
+		corpus, err = runner.Preload(ctx, rdb, cfg, caps, log, flagDebug2)
 		if err != nil {
 			return err
 		}
