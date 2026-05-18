@@ -82,8 +82,12 @@ if [[ "${SKIP_APT:-0}" != "1" ]]; then
     $SUDO apt-get install -y --no-install-recommends \
         build-essential \
         clang \
+        clang-14 \
         lld \
         llvm \
+        llvm-14-dev \
+        libclang-14-dev \
+        libpolly-14-dev \
         cmake \
         pkg-config \
         git \
