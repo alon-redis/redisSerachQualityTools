@@ -27,6 +27,9 @@
 #   SKIP_BUILD=1      Stop after layout+patch (don't run make)
 #   SKIP_SMOKE=1      Skip the post-build replay smoke test
 #   JOBS              Parallelism for make / git clone (default: nproc)
+#   RUSTFLAGS         Forwarded to cargo. The script appends
+#                     "--cap-lints warn" so newer rustc lints don't
+#                     break pinned LibAFL v0.15.3's `-D warnings`.
 #
 # Exit codes:
 #   0  success
@@ -237,6 +240,13 @@ fi
 
 cd "$PREFIX"
 log "Building (this can take 15-40 minutes on t3.xlarge)..."
+
+# Pinned LibAFL v0.15.3 has `-D warnings` baked in; newer rustc (>= 1.85)
+# enables additional lints (e.g. `function-casts-as-integer`) that become
+# hard errors. Cap every lint to "warn" to neutralise that upgrade.
+export RUSTFLAGS="${RUSTFLAGS:-} --cap-lints warn"
+log "Using RUSTFLAGS='$RUSTFLAGS'"
+
 if ! make -j"$JOBS" 2>&1 | tee /tmp/redis-fuzz-build.log; then
     warn "First build failed. Checking for boost-qvm issue..."
     if apply_boost_patch; then
