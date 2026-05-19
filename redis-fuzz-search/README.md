@@ -56,27 +56,3 @@ The Rust command generator ([src/smith.rs](src/smith.rs) `search_arg_override`, 
 
 ## Triage
 See [triage.py](triage.py) and [minimize.py](minimize.py) — replay crashing inputs from `./crashes/`, group by top stack frame, and shrink the reproducing command sequence.
-
-## Network-mode companion (`netfuzz.py`)
-The `./fuzz` binary links Redis into its own process; it has no notion of "host" or "port" and cannot target a remote Redis. For testing managed/remote endpoints (Redis Cloud, Redis Enterprise, Flex, a different port on localhost, etc.), use [netfuzz.py](netfuzz.py) — a Python driver that mirrors the same seeded-index + biased-vocab strategy but fires over the wire.
-
-Trade-off: no coverage feedback in network mode. It's blind stress with smart inputs.
-
-```bash
-pip3 install redis
-python3 netfuzz.py --redis redis://your.host:11000 --threads 16 --duration 300
-
-# auth-protected endpoint
-python3 netfuzz.py --redis redis://user:pass@your.host:11000/0
-
-# just seed the index and exit (handy before running other tools)
-python3 netfuzz.py --redis redis://your.host:6379 --seed-only
-
-# don't reseed (assume idx/sug/dict/g1 are already created)
-python3 netfuzz.py --redis redis://your.host:6379 --no-seed
-
-# capture every server error to a log
-python3 netfuzz.py --redis redis://your.host:6379 --error-log /tmp/qa_errors.log
-```
-
-The driver re-uses the index name `idx`, doc prefix `doc:`, suggestion list `sug`, dictionary `dict`, and synonym group `g1` from the in-process harness, so error reports / repros are directly comparable between the two modes.
